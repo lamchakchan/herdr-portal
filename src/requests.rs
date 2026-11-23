@@ -602,67 +602,111 @@ fn tick_machine(machine: &Machine) -> Result<(Vec<Value>, HashSet<u16>)> {
 
 /// One pass over every saved machine: agent requests always, auto-forward
 /// when `with_auto`, closing auto forwards the `[auto]` rules no longer allow.
-fn tick(with_auto: bool) -> Result<Vec<Value>> {
-    let auto_config = if with_auto {
-        Some(auto::load_config())
-    } else {
-        None
-    };
-    let mut out = Vec::new();
-    for machine in load_machines()? {
-        let result = tick_machine(&machine).and_then(|(mut actions, wanted)| {
-            match &auto_config {
-                // Disabled still runs, so auto forwards close once auto is turned off.
-                Some(Ok(config)) => {
-                    actions.extend(auto::tick_machine(&machine, config, &wanted)?);
-                }
-                Some(Err(error)) => return Err(anyhow!("{error:#}")),
-                _ => {}
-            }
-            Ok(actions)
-        });
-        match result {
-            Ok(actions) => out.push(json!({
-                "machine": machine.label,
-                "machine_id": machine.id,
-                "ok": true,
-                "actions": actions,
-            })),
-            Err(error) => out.push(json!({
-                "machine": machine.label,
-                "machine_id": machine.id,
-                "ok": false,
-                "error": {"code": error_code(&error), "message": format!("{error:#}")},
-            })),
-        }
-    }
-    Ok(out)
+/// What one pass did. `auto` is None when the pass skipped auto-forward, and
+/// otherwise holds the config error, if the config didn't load.
+struct Pass {
+    machines: Vec<Value>,
+    auto: Option<Option<String>>,
 }
 
-fn print_actions(machines: &[Value], only_changed: bool) {
+fn tick(with_auto: bool) -> Result<Pass> {
+    let config = with_auto.then(auto::load_config);
+    let config_error = match &config {
+        Some(Err(error)) => Some(Some(format!("{error:#}"))),
+        Some(Ok(_)) => Some(None),
+        None => None,
+    };
+    let mut machines = Vec::new();
+    for machine in load_machines()? {
+        let mut row = json!({"machine": machine.label, "machine_id": machine.id});
+        match tick_machine(&machine) {
+            Ok((mut actions, wanted)) => {
+                row["ok"] = json!(true);
+                // Disabled still runs, so auto forwards close once auto is turned off.
+                // A config that doesn't load runs nothing, leaving auto forwards as they are.
+                if let Some(Ok(config)) = &config {
+                    match auto::tick_machine(&machine, config, &wanted) {
+                        Ok(more) => {
+                            actions.extend(more);
+                            row["auto_error"] = Value::Null;
+                        }
+                        Err(error) => {
+                            row["auto_error"] = json!({
+                                "code": error_code(&error),
+                                "message": format!("{error:#}"),
+                            });
+                        }
+                    }
+                }
+                row["actions"] = json!(actions);
+            }
+            Err(error) => {
+                row["ok"] = json!(false);
+                row["error"] = json!({"code": error_code(&error), "message": format!("{error:#}")});
+            }
+        }
+        machines.push(row);
+    }
+    Ok(Pass {
+        machines,
+        auto: config_error,
+    })
+}
+
+fn stamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        % 86_400;
+    format!("{:02}:{:02}:{:02}Z", secs / 3600, secs / 60 % 60, secs % 60)
+}
+
+fn action_line(label: &str, a: &Value) -> String {
+    let mut line = format!(
+        "{label}: {} {} -> {} ({})",
+        a["action"].as_str().unwrap_or("?"),
+        a["remote_port"],
+        a["local_port"],
+        a["status"].as_str().unwrap_or("-"),
+    );
+    if let Some(code) = a["error"].as_str() {
+        line.push_str(&format!(" {code}"));
+    }
+    line
+}
+
+fn print_actions(machines: &[Value]) {
     for m in machines {
         let label = m["machine"].as_str().unwrap_or("?");
         if m["ok"] == json!(false) {
-            if !only_changed {
-                println!(
-                    "{label}: {}",
-                    m["error"]["message"].as_str().unwrap_or("error")
-                );
-            }
+            println!(
+                "{label}: {}",
+                m["error"]["message"].as_str().unwrap_or("error")
+            );
             continue;
         }
-        for a in m["actions"].as_array().into_iter().flatten() {
-            if only_changed && a["changed"] != json!(true) {
-                continue;
-            }
-            println!(
-                "{label}: {} {} -> {} ({})",
-                a["action"].as_str().unwrap_or("?"),
-                a["remote_port"],
-                a["local_port"],
-                a["status"].as_str().unwrap_or("-"),
-            );
+        if let Some(message) = m["auto_error"]["message"].as_str() {
+            println!("{label}: auto: {message}");
         }
+        for a in m["actions"].as_array().into_iter().flatten() {
+            println!("{}", action_line(label, a));
+        }
+    }
+}
+
+/// Prints a line the first time an error appears, changes or clears.
+fn log_change(last: &mut HashMap<String, String>, key: String, message: String, what: &str) {
+    if last.get(&key) == Some(&message) {
+        return;
+    }
+    if message.is_empty() {
+        if last.contains_key(&key) {
+            println!("{} watch: {what}: ok again", stamp());
+        }
+        last.remove(&key);
+    } else {
+        println!("{} watch: {what}: {message}", stamp());
+        last.insert(key, message);
     }
 }
 
@@ -756,20 +800,39 @@ fn run_loop(interval: Duration, restore_first: bool) -> Result<()> {
             last_auto = Some(Instant::now());
         }
         match tick(with_auto) {
-            Ok(machines) => {
-                print_actions(&machines, true);
-                for m in &machines {
-                    let label = m["machine"].as_str().unwrap_or("?").to_string();
-                    let message = m["error"]["message"].as_str().unwrap_or("").to_string();
-                    if last_errors.get(&label) != Some(&message) {
-                        if !message.is_empty() {
-                            println!("watch: {label}: {message}");
+            Ok(pass) => {
+                for m in &pass.machines {
+                    let label = m["machine"].as_str().unwrap_or("?");
+                    for a in m["actions"].as_array().into_iter().flatten() {
+                        if a["changed"] == json!(true) {
+                            println!("{} {}", stamp(), action_line(label, a));
                         }
-                        last_errors.insert(label, message);
+                    }
+                    let message = m["error"]["message"].as_str().unwrap_or("").to_string();
+                    log_change(&mut last_errors, label.to_string(), message, label);
+                    if with_auto && m["ok"] == json!(true) {
+                        let message = m["auto_error"]["message"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        log_change(
+                            &mut last_errors,
+                            format!("{label} auto"),
+                            message,
+                            &format!("{label} auto"),
+                        );
                     }
                 }
+                if let Some(config_error) = pass.auto {
+                    log_change(
+                        &mut last_errors,
+                        "auto config".into(),
+                        config_error.unwrap_or_default(),
+                        "auto config",
+                    );
+                }
             }
-            Err(error) => println!("watch: pass failed: {error:#}"),
+            Err(error) => println!("{} watch: pass failed: {error:#}", stamp()),
         }
         let _ = io::stdout().flush();
         std::thread::sleep(interval);
@@ -877,11 +940,19 @@ pub(crate) fn cmd_watch(args: &[String], json_out: bool) -> Result<()> {
         return Ok(());
     }
     if args.switches.contains("--once") {
-        let machines = tick(true)?;
+        let pass = tick(true)?;
+        let config_error = pass.auto.flatten();
         if json_out {
-            return print_json(&json!({"ok": true, "machines": machines}));
+            return print_json(&json!({
+                "ok": true,
+                "machines": pass.machines,
+                "auto": {"error": config_error},
+            }));
         }
-        print_actions(&machines, false);
+        if let Some(message) = config_error {
+            println!("auto config: {message}");
+        }
+        print_actions(&pass.machines);
         return Ok(());
     }
     let interval = match args.flags.get("--interval") {
@@ -995,6 +1066,28 @@ mod tests {
         assert_eq!(row["localhost_url"], json!("http://localhost:6000"));
         req.status = Some(Status::Error("ssh_failed".into()));
         assert_eq!(request_json(&req, None)["error"], json!("ssh_failed"));
+    }
+
+    #[test]
+    fn errors_are_logged_once_per_change() {
+        let mut last = HashMap::new();
+        log_change(&mut last, "k".into(), "bad".into(), "x");
+        assert_eq!(last.get("k").map(String::as_str), Some("bad"));
+        log_change(&mut last, "k".into(), "bad".into(), "x");
+        assert_eq!(last.len(), 1);
+        log_change(&mut last, "k".into(), String::new(), "x");
+        assert!(last.is_empty());
+    }
+
+    #[test]
+    fn skip_lines_carry_the_error_code() {
+        let a = json!({"action": "auto-skip", "remote_port": 20487, "local_port": null,
+                       "status": "skipped", "error": "local_port_in_use"});
+        assert_eq!(
+            action_line("dell", &a),
+            "dell: auto-skip 20487 -> null (skipped) local_port_in_use"
+        );
+        assert!(stamp().ends_with('Z') && stamp().len() == 9);
     }
 
     #[test]

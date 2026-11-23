@@ -323,8 +323,11 @@ skip = [4200]                    # never auto-forward these
   auto-stopped.
 - An auto forward closes after its listener has been gone for two scans in a
   row, or once the rules stop allowing it, including `enabled = false`.
-- `watch --status --json` shows whether auto is on, the config path, and the
-  error if the file doesn't parse.
+- If `config.toml` doesn't parse, auto does nothing until it's fixed, and
+  forwards it already opened stay open. `watch --status --json` shows whether
+  auto is on, the config path and the error; the log has the error once, and
+  `auto config: ok again` when it clears.
+- Log lines start with the UTC time of day.
 
 ## Requirements
 
