@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 mod picker;
 mod sharing;
 
-const PLUGIN_ID: &str = "herdr.ports_forwarding";
+const PLUGIN_ID: &str = "lamchakchan.herdr-portal";
 const LOCAL_ID: &str = "local";
 
 #[derive(Clone, Debug)]
@@ -81,7 +81,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if args[0] == "pick" {
-        if let Ok(port) = env::var("HERDR_PORTS_PORT") {
+        if let Ok(port) = env::var("HERDR_PORTAL_PORT") {
             if !args.iter().any(|a| a == "--port") {
                 args.splice(1..1, ["--port".into(), port]);
             }
@@ -109,7 +109,7 @@ fn run() -> Result<()> {
 
 fn print_help() {
     println!(
-        "herdr-ports — open a remote Herdr workspace port on this laptop
+        "herdr-portal — open a remote Herdr workspace port on this laptop
 
   URL: http://herdr.{{workspace}}.localhost:{{port}}
 
@@ -336,7 +336,7 @@ fn parse_lsof(text: &str) -> Vec<Listener> {
 }
 
 fn dedupe(items: Vec<Listener>) -> Vec<Listener> {
-    let skip: HashSet<&str> = ["sshd", "ssh", "herdr-ports"].into_iter().collect();
+    let skip: HashSet<&str> = ["sshd", "ssh", "herdr-portal"].into_iter().collect();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for item in items {
@@ -377,7 +377,7 @@ fn local_port_holder(port: u16) -> Option<String> {
 fn control_path(target: &str) -> Result<PathBuf> {
     // macOS sockaddr_un.sun_path is 104 bytes. Herdr plugin state dirs are too long.
     let digest = hex_digest(target.as_bytes());
-    Ok(PathBuf::from("/tmp").join(format!("hp-{}", &digest[..12])))
+    Ok(PathBuf::from("/tmp").join(format!("hpl-{}", &digest[..12])))
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -1064,7 +1064,7 @@ fn cmd_list() -> Result<()> {
 fn cmd_add(args: &[String]) -> Result<()> {
     if args.len() < 2 {
         bail!(
-            "usage: herdr-ports add <machine> <port> [--local-port N] [--workspace NAME] [--open]"
+            "usage: herdr-portal add <machine> <port> [--local-port N] [--workspace NAME] [--open]"
         );
     }
     let selector = &args[0];
@@ -1119,7 +1119,7 @@ fn cmd_add(args: &[String]) -> Result<()> {
 
 fn cmd_stop(args: &[String]) -> Result<()> {
     if args.len() != 1 {
-        bail!("usage: herdr-ports stop <local-port>");
+        bail!("usage: herdr-portal stop <local-port>");
     }
     let port: u16 = args[0].parse()?;
     stop_forward(port)?;
@@ -1200,7 +1200,7 @@ fn cmd_open_picker(args: &[String]) -> Result<()> {
     ];
     let env_arg;
     if args.first().map(String::as_str) == Some("--port") && args.len() > 1 {
-        env_arg = format!("HERDR_PORTS_PORT={}", args[1]);
+        env_arg = format!("HERDR_PORTAL_PORT={}", args[1]);
         argv.extend(["--env", env_arg.as_str()]);
     }
     let (code, stdout, stderr) = run_cmd(&argv, None)?;

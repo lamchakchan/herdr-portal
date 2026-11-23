@@ -1,4 +1,4 @@
-# Remote Ports
+# Herdr Portal
 
 A [Herdr](https://herdr.dev) plugin. Forward a listener from a remote Herdr
 workspace onto this laptop as:
@@ -7,15 +7,20 @@ workspace onto this laptop as:
 http://herdr.{workspace}.localhost:{port}
 ```
 
-Plugin id: `herdr.ports_forwarding`  
-Binary: `herdr-ports` (Rust)
+Plugin id: `lamchakchan.herdr-portal`  
+Binary: `herdr-portal` (Rust)
 
 It uses native saved machines (`herdr machine add`). It does not wrap
 `herdr --remote`.
 
+Herdr Portal started as a copy of [randomradio/herdr-ports](https://github.com/randomradio/herdr-ports)
+(MIT), with its full history kept. On top of that it adds a JSON API for agents
+and scripts (see [API](#api)).
+
 ![Forward a workmbp loopback port](docs/demo.gif)
 
-The recording is a real session: a loopback service on `workmbp` (Tailscale
+The recording is the upstream demo, made before the rename, so it shows the
+`herdr-ports` command. It is a real session: a loopback service on `workmbp` (Tailscale
 `chenyangzhaos-macbook-pro`) fails on this laptop until `herdr-ports add`
 opens SSH `-L`. [MP4](docs/demo.mp4) · [asciicast](docs/demo.cast) ·
 re-record with `docs/record-session.sh`.
@@ -33,7 +38,7 @@ Tunnels are SSH `-L` forwards on a ControlMaster that:
   does not kill the mux
 - uses `ControlPersist=yes`
 - is recorded in plugin state
-- is restored by `./herdr-ports restore` on Herdr startup
+- is restored by `./herdr-portal restore` on Herdr startup
 
 Closing the popup leaves its forwards running. A forward stops when you toggle
 it off, run `stop`, reboot, or lose its SSH connection. Saved forwards can be
@@ -120,7 +125,7 @@ interface-only services need a compatible remote listener.
 Needs `cargo` on the machine that installs the plugin.
 
 ```bash
-herdr plugin install randomradio/herdr-ports --yes
+herdr plugin install lamchakchan/herdr-portal --yes
 herdr server reload-config
 ```
 
@@ -129,13 +134,13 @@ checkout, build and link it instead:
 
 ```bash
 cargo build --release
-cp target/release/herdr-ports herdr-ports
+cp target/release/herdr-portal herdr-portal
 herdr plugin link "$PWD" --enabled
 herdr server reload-config
 ```
 
 Close and reopen an existing popup after an update. To switch a local link back
-to a GitHub installation, first run `herdr plugin unlink herdr.ports_forwarding`.
+to a GitHub installation, first run `herdr plugin unlink lamchakchan.herdr-portal`.
 
 ## Keybinding
 
@@ -143,7 +148,7 @@ to a GitHub installation, first run `herdr plugin unlink herdr.ports_forwarding`
 [[keys.command]]
 key = "prefix+shift+p"
 type = "plugin_action"
-command = "herdr.ports_forwarding.pick"
+command = "lamchakchan.herdr-portal.pick"
 description = "pick remote port"
 ```
 
@@ -151,17 +156,17 @@ Reload config after install (global menu → `reload config`).
 
 ## CLI
 
-After install, `herdr-ports` is in the plugin root.
+After install, `herdr-portal` is in the plugin root.
 
 ```bash
-./herdr-ports scan workbox
-./herdr-ports scan workbox --json
-./herdr-ports pick workbox
-./herdr-ports add workbox 8765 --open
-./herdr-ports add workbox 8765 --local-port 18765 --workspace mo
-./herdr-ports list
-./herdr-ports stop 8765
-./herdr-ports restore
+./herdr-portal scan workbox
+./herdr-portal scan workbox --json
+./herdr-portal pick workbox
+./herdr-portal add workbox 8765 --open
+./herdr-portal add workbox 8765 --local-port 18765 --workspace mo
+./herdr-portal list
+./herdr-portal stop 8765
+./herdr-portal restore
 ```
 
 ## Requirements
@@ -182,5 +187,5 @@ about every 30 minutes: https://herdr.dev/plugins/
 Install from GitHub:
 
 ```bash
-herdr plugin install randomradio/herdr-ports --yes
+herdr plugin install lamchakchan/herdr-portal --yes
 ```

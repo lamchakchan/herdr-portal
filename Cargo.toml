@@ -1,9 +1,9 @@
 [package]
-name = "herdr-ports"
-version = "0.4.0"
+name = "herdr-portal"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
-description = "Forward a Herdr workspace port to herdr.{workspace}.localhost:{port}"
+description = "Forward remote Herdr workspace ports to this laptop, with a JSON API for agents"
 
 [dependencies]
 anyhow = "1"

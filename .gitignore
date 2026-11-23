@@ -1,5 +1,5 @@
 /target/
-herdr-ports
+herdr-portal
 __pycache__/
 *.py[cod]
 .pytest_cache/

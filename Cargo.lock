@@ -155,8 +155,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "herdr-ports"
-version = "0.4.0"
+name = "herdr-portal"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "crossterm",
