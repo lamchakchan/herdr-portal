@@ -144,6 +144,7 @@ pub(crate) fn forward_json(forward: &Forward, state: State) -> Value {
         "workspace_id": Value::Null,
         "tab_id": Value::Null,
         "pane_id": forward.pane_id,
+        "origin": forward.origin,
         "agent": Value::Null,
         "agent_name": Value::Null,
         "process": Value::Null,
@@ -169,6 +170,7 @@ pub(crate) fn scan_json(
         "workspace_id": (!item.workspace_id.is_empty()).then_some(&item.workspace_id),
         "tab_id": item.tab_id,
         "pane_id": item.pane_id.clone().or_else(|| forward.and_then(|f| f.pane_id.clone())),
+        "origin": forward.map(|f| f.origin),
         "agent": item.agent,
         "agent_name": item.agent_name,
         "process": item.process,
@@ -523,5 +525,6 @@ mod tests {
         assert_eq!(row["port"], json!(5173));
         assert_eq!(row["status"], json!("○"));
         assert_eq!(row["forwarded"], json!(false));
+        assert_eq!(row["origin"], Value::Null);
     }
 }

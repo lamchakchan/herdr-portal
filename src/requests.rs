@@ -556,7 +556,11 @@ fn tick_machine(machine: &Machine) -> Result<Vec<Value>> {
             status: Some(status),
             ..req.clone()
         };
-        let mut row = request_json(&answered, None);
+        let label = labels
+            .iter()
+            .find(|(id, _)| *id == req.workspace_id)
+            .map_or(req.workspace_id.as_str(), |(_, l)| l.as_str());
+        let mut row = request_json(&answered, Some(label));
         row["action"] = json!(
             if how == "add" || how == "resume" || how == "error" || wrote {
                 how
@@ -768,5 +772,7 @@ mod tests {
         assert_eq!(items[0].origin, Origin::Manual);
         let text = serde_json::to_string(&items[0]).unwrap();
         assert!(text.contains(r#""origin":"manual""#));
+        let row = api::forward_json(&items[0], api::State::Inactive);
+        assert_eq!(row["origin"], json!("manual"));
     }
 }

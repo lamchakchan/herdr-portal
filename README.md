@@ -205,6 +205,7 @@ return `{"ok": true, "port": {...}}`. Every port has this shape:
   "state": "active",
   "url": "http://herdr.web.localhost:5173",
   "workspace": "web", "workspace_id": "w3", "tab_id": "w3:t1", "pane_id": "w3:p2",
+  "origin": "manual",
   "agent": "claude", "agent_name": null,
   "process": "node", "pid": 4242
 }
@@ -220,7 +221,9 @@ return `{"ok": true, "port": {...}}`. Every port has this shape:
 process ancestry ties the listener to a pane. They're null for detached servers
 matched by directory, and `list` reports only the `pane_id` that `add` saved.
 `scan` rows also keep the fields of the first JSON format: `port`, `saved`,
-`forwarded` and `status`. Asking `add` for a forward that is already active
+`forwarded` and `status`. `origin` says who opened a saved forward: `manual`
+(`add`, the picker or restore), `request` (an agent request) or `auto`; it is
+null for a port that isn't saved. Asking `add` for a forward that is already active
 returns it unchanged.
 
 | Error code | When |
