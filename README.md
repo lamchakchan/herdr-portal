@@ -64,7 +64,7 @@ at the machine list closes the popup. Port conflicts open a local-port prompt.
 Alive means the SSH master is running and owns the local forwarding listener.
 It does not confirm that the remote application responds. Saved forwards remain
 visible after their tunnel stops. `stop <local-port>` also removes an inactive
-saved forward. JSON scans include `saved`, `forwarded` (alive), and `status`.
+saved forward. See [API](#api) for JSON output.
 
 The popup keeps errors visible and leaves active forwards running when closed.
 Machine, workspace, and port lists are cached while the popup is open. Going
@@ -166,8 +166,73 @@ After install, `herdr-portal` is in the plugin root.
 ./herdr-portal add workbox 8765 --local-port 18765 --workspace mo
 ./herdr-portal list
 ./herdr-portal stop 8765
+./herdr-portal stop 8765 --keep    # pause: stays saved as inactive
+./herdr-portal start 8765          # resume an inactive forward
 ./herdr-portal restore
 ```
+
+Run outside herdr, the CLI uses the same state folder that herdr hands the plugin
+(`${XDG_STATE_HOME:-~/.local/state}/herdr/plugins/lamchakchan.herdr-portal`).
+Forwards added from a shell therefore show in the popup and come back with the
+startup `restore`. If `herdr` on a remote machine isn't on the PATH of a
+non-interactive SSH shell, set `HERDR_PORTAL_REMOTE_HERDR` to its full path.
+
+## API
+
+The API for agents and scripts is the CLI with `--json`. It doesn't run a server.
+`scan`, `list`, `add`, `stop` and `start` each print one JSON object on stdout.
+
+- Success: `{"ok": true, ...}`, exit 0.
+- Failure: `{"ok": false, "error": {"code": "...", "message": "..."}}`, exit 1.
+
+| Task | Command |
+| --- | --- |
+| Ports per agent | `scan <machine> --json --agent <pane-id or agent name>` (also `--pane`, `--workspace`) |
+| All active forwards | `list --json --state active` |
+| All inactive forwards | `list --json --state inactive` |
+| Remote ports not forwarded | `scan <machine> --json --state available` |
+| Open a forward | `add <machine> <port> [--local-port N] --json` |
+| Close a forward | `stop <local-port> --json` (add `--keep` to pause it instead) |
+| Resume a paused forward | `start <local-port> --json` |
+
+Ports come back as `{"ok": true, "ports": [...]}`; `add`, `stop` and `start`
+return `{"ok": true, "port": {...}}`. Every port has this shape:
+
+```json
+{
+  "machine": "dell", "machine_id": "5b4e…",
+  "remote_port": 5173, "local_port": 5173,
+  "state": "active",
+  "url": "http://herdr.web.localhost:5173",
+  "workspace": "web", "workspace_id": "w3", "tab_id": "w3:t1", "pane_id": "w3:p2",
+  "agent": "claude", "agent_name": null,
+  "process": "node", "pid": 4242
+}
+```
+
+| `state` | Meaning |
+| --- | --- |
+| `active` | Saved, and the SSH master owns the local listener (●). |
+| `inactive` | Saved but not running (◐): paused with `stop --keep`, or lost after a reboot or SSH drop. |
+| `available` | Listening on the remote machine but not forwarded (○). Only `scan` reports it. |
+
+`local_port` is null while a port is `available`. The pane fields are set when
+process ancestry ties the listener to a pane. They're null for detached servers
+matched by directory, and `list` reports only the `pane_id` that `add` saved.
+`scan` rows also keep the fields of the first JSON format: `port`, `saved`,
+`forwarded` and `status`. Asking `add` for a forward that is already active
+returns it unchanged.
+
+| Error code | When |
+| --- | --- |
+| `invalid_args` | Unknown command, flag or port. |
+| `machine_not_found` | No saved machine matches the selector. |
+| `local_port_in_use` | Another process holds the local port; retry with `--local-port`. |
+| `no_forward` | No tracked forward on that local port. |
+| `not_inactive` | `start` on a forward that is already active. |
+| `ssh_failed` | An SSH control command failed. |
+| `herdr_failed` | `herdr` on the target machine failed or wasn't found. |
+| `internal` | Anything else. |
 
 ## Requirements
 
