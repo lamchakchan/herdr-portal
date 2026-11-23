@@ -87,13 +87,17 @@ fn forward_workspace(forward: &Forward) -> &str {
 
 /// Arguments left after the flags a command knows are pulled out.
 #[derive(Debug)]
-struct Args {
-    positional: Vec<String>,
-    flags: HashMap<&'static str, String>,
-    switches: HashSet<&'static str>,
+pub(crate) struct Args {
+    pub positional: Vec<String>,
+    pub flags: HashMap<&'static str, String>,
+    pub switches: HashSet<&'static str>,
 }
 
-fn parse_args(args: &[String], valued: &[&'static str], switches: &[&'static str]) -> Result<Args> {
+pub(crate) fn parse_args(
+    args: &[String],
+    valued: &[&'static str],
+    switches: &[&'static str],
+) -> Result<Args> {
     let mut out = Args {
         positional: Vec::new(),
         flags: HashMap::new(),
@@ -121,14 +125,14 @@ fn parse_args(args: &[String], valued: &[&'static str], switches: &[&'static str
     Ok(out)
 }
 
-fn parse_port(text: &str) -> Result<u16> {
+pub(crate) fn parse_port(text: &str) -> Result<u16> {
     text.parse::<u16>()
         .ok()
         .filter(|port| *port != 0)
         .ok_or_else(|| err("invalid_args", format!("'{text}' is not a TCP port")))
 }
 
-fn forward_json(forward: &Forward, state: State) -> Value {
+pub(crate) fn forward_json(forward: &Forward, state: State) -> Value {
     json!({
         "machine": forward.label,
         "machine_id": forward.machine_id,
@@ -147,7 +151,7 @@ fn forward_json(forward: &Forward, state: State) -> Value {
     })
 }
 
-fn scan_json(
+pub(crate) fn scan_json(
     machine: &Machine,
     item: &WorkspacePort,
     forward: Option<&Forward>,
@@ -177,7 +181,7 @@ fn scan_json(
     })
 }
 
-fn print_json(value: &Value) -> Result<()> {
+pub(crate) fn print_json(value: &Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }

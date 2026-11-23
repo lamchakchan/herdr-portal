@@ -234,6 +234,51 @@ returns it unchanged.
 | `herdr_failed` | `herdr` on the target machine failed or wasn't found. |
 | `internal` | Anything else. |
 
+## Agent requests
+
+An agent on the remote machine can ask the laptop for a forward without any
+access to the laptop. It sets a token on its own Herdr pane; `watch` on the
+laptop reads every saved machine's panes, opens the forward, and answers on the
+same pane. Nothing has to be installed on the remote machine.
+
+On the remote machine, inside a Herdr pane:
+
+```sh
+herdr-portal request 5173 --wait 10 --json   # same local port
+herdr-portal request 5173 --any --json       # any free local port
+herdr-portal request 5173 --local-port 6000 --json
+herdr-portal requests --json                 # this pane; --all for every pane
+herdr-portal release 5173 --json
+```
+
+`request` returns `{"ok": true, "request": {...}}` with `status` `pending`
+until the laptop answers, then `active` with `local_port`, `url` and
+`localhost_url`. With `--wait SECS` it waits for that answer. If the laptop
+can't forward the port, the request fails with the laptop's error code, such as
+`local_port_in_use`. Ports below 1024 are refused.
+
+Without the plugin installed there, the same request is two Herdr calls:
+
+```sh
+herdr pane report-metadata "$HERDR_PANE_ID" --source herdr-portal --token portal_req_5173=same@1
+herdr pane get "$HERDR_PANE_ID"   # .result.pane.tokens.portal_st_5173 is active:5173@1
+herdr pane report-metadata "$HERDR_PANE_ID" --source herdr-portal --clear-token portal_req_5173
+```
+
+| Token | Written by | Value |
+| --- | --- | --- |
+| `portal_req_<port>` | the agent, source `herdr-portal` | `same`, `any` or a local port, then `@<nonce>` |
+| `portal_st_<port>` | `watch`, source `herdr-portal-client` | `pending`, `active:<local-port>` or `error:<code>`, then the request's `@<nonce>` |
+
+The nonce is `[0-9a-z]`; an answer counts only when its nonce matches the
+request, so a new request never reads an old answer.
+
+On the laptop, `herdr-portal watch --once --json` runs one pass over every
+saved machine. It opens forwards for new requests, resumes saved ones, and
+reuses a forward already open on that remote port, including one opened by
+hand. When the request or its pane goes away, it closes only forwards it opened
+itself. A pane closing therefore takes its forwards with it.
+
 ## Requirements
 
 - Herdr 0.9.0 or newer

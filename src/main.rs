@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 
 mod api;
 mod picker;
+mod requests;
 mod sharing;
 
 const PLUGIN_ID: &str = "lamchakchan.herdr-portal";
@@ -59,6 +60,18 @@ struct Forward {
     workspace_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pane_id: Option<String>,
+    #[serde(default)]
+    origin: Origin,
+}
+
+/// Who opened a forward. `watch` only ever stops the ones it opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Origin {
+    #[default]
+    Manual,
+    Request,
+    Auto,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +122,10 @@ fn run(mut args: Vec<String>, json_out: bool) -> Result<()> {
         "list" => api::cmd_list(&args[1..], json_out),
         "stop" => api::cmd_stop(&args[1..], json_out),
         "start" => api::cmd_start(&args[1..], json_out),
+        "request" => requests::cmd_request(&args[1..], json_out),
+        "release" => requests::cmd_release(&args[1..], json_out),
+        "requests" => requests::cmd_requests(&args[1..], json_out),
+        "watch" => requests::cmd_watch(&args[1..], json_out),
         "restore" => cmd_restore(),
         "open-picker" => cmd_open_picker(&args[1..]),
         "from-url" => cmd_from_url(),
@@ -139,6 +156,12 @@ fn print_help() {
   stop <local-port> [--keep]
   start <local-port>
   restore
+
+Agent requests (run in a Herdr pane on the machine where the service listens):
+  request <port> [--local-port N | --any] [--pane ID] [--wait SECS]
+  release <port> [--pane ID]
+  requests [--all | --pane ID]
+  watch --once     on the laptop: open and close forwards that panes ask for
 
 Add --json to scan, list, add, stop or start for one JSON object on stdout:
 {{\"ok\": true, ...}} on success, {{\"ok\": false, \"error\": {{\"code\", \"message\"}}}} on failure.
@@ -947,6 +970,7 @@ fn add_forward(
             local_port,
             workspace_label: workspace_label.to_string(),
             pane_id,
+            origin: Origin::Manual,
         };
         let mut items = load_forwards()?;
         items.retain(|item| !(item.machine_id == LOCAL_ID && item.local_port == local_port));
@@ -978,6 +1002,7 @@ fn add_forward(
         local_port,
         workspace_label: workspace_label.to_string(),
         pane_id,
+        origin: Origin::Manual,
     };
     items.push(forward.clone());
     save_forwards(&items)?;
