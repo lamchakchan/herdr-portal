@@ -561,13 +561,13 @@ fn tick_machine(machine: &Machine) -> Result<Vec<Value>> {
             .find(|(id, _)| *id == req.workspace_id)
             .map_or(req.workspace_id.as_str(), |(_, l)| l.as_str());
         let mut row = request_json(&answered, Some(label));
-        row["action"] = json!(
-            if how == "add" || how == "resume" || how == "error" || wrote {
-                how
-            } else {
-                "none"
-            }
-        );
+        let opened = how == "add" || how == "resume";
+        row["action"] = json!(if opened || how == "error" || wrote {
+            how
+        } else {
+            "none"
+        });
+        row["changed"] = json!(opened || wrote);
         actions.push(row);
     }
 
@@ -579,6 +579,7 @@ fn tick_machine(machine: &Machine) -> Result<Vec<Value>> {
             let outcome = stop_forward(forward.local_port, false);
             actions.push(json!({
                 "action": if outcome.is_ok() { "stop" } else { "error" },
+                "changed": outcome.is_ok(),
                 "remote_port": forward.remote_port,
                 "local_port": forward.local_port,
                 "pane_id": forward.pane_id,
@@ -619,28 +620,22 @@ fn tick() -> Result<Vec<Value>> {
     Ok(out)
 }
 
-pub(crate) fn cmd_watch(args: &[String], json_out: bool) -> Result<()> {
-    let args = parse_args(args, &[], &["--once"])?;
-    if !args.positional.is_empty() || !args.switches.contains("--once") {
-        return Err(err(
-            "invalid_args",
-            "usage: herdr-portal watch --once [--json] (the long-running loop is not built yet)",
-        ));
-    }
-    let machines = tick()?;
-    if json_out {
-        return print_json(&json!({"ok": true, "machines": machines}));
-    }
-    for m in &machines {
+fn print_actions(machines: &[Value], only_changed: bool) {
+    for m in machines {
         let label = m["machine"].as_str().unwrap_or("?");
         if m["ok"] == json!(false) {
-            println!(
-                "{label}: {}",
-                m["error"]["message"].as_str().unwrap_or("error")
-            );
+            if !only_changed {
+                println!(
+                    "{label}: {}",
+                    m["error"]["message"].as_str().unwrap_or("error")
+                );
+            }
             continue;
         }
         for a in m["actions"].as_array().into_iter().flatten() {
+            if only_changed && a["changed"] != json!(true) {
+                continue;
+            }
             println!(
                 "{label}: {} {} -> {} ({})",
                 a["action"].as_str().unwrap_or("?"),
@@ -650,7 +645,227 @@ pub(crate) fn cmd_watch(args: &[String], json_out: bool) -> Result<()> {
             );
         }
     }
+}
+
+fn lock_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("watch.lock"))
+}
+
+fn log_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("watch.log"))
+}
+
+/// Holds the single-instance lock for as long as the file stays open. The
+/// descriptor is close-on-exec, so a re-exec hands the lock to the new image.
+fn try_lock() -> Result<Option<fs::File>> {
+    use std::os::unix::io::AsRawFd;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path()?)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Ok(None);
+    }
+    file.set_len(0)?;
+    let mut writer = &file;
+    writeln!(writer, "{}", std::process::id())?;
+    Ok(Some(file))
+}
+
+fn lock_owner() -> Option<u32> {
+    fs::read_to_string(lock_path().ok()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The binary herdr would run now, when this process runs from a plugin install.
+fn installed_binary() -> Option<PathBuf> {
+    let current = env::current_exe().ok()?.canonicalize().ok()?;
+    let plugins = home_dir().ok()?.join(".config/herdr/plugins");
+    if !current.starts_with(&plugins) {
+        return None;
+    }
+    let text = fs::read_to_string(plugins.join("../plugins.json")).ok()?;
+    let rows: Vec<Value> = serde_json::from_str(&text).ok()?;
+    let root = rows
+        .iter()
+        .find(|row| row["plugin_id"] == json!(PLUGIN_ID))?["plugin_root"]
+        .as_str()?
+        .to_string();
+    let candidate = Path::new(&root).join("herdr-portal").canonicalize().ok()?;
+    (candidate != current).then_some(candidate)
+}
+
+fn reexec(binary: &Path) {
+    use std::os::unix::process::CommandExt;
+    let args: Vec<String> = env::args().skip(1).collect();
+    println!("watch: plugin updated, switching to {}", binary.display());
+    let error = Command::new(binary).args(&args).exec();
+    println!("watch: re-exec failed: {error}; staying on this binary");
+}
+
+fn run_loop(interval: Duration, restore_first: bool) -> Result<()> {
+    let Some(_lock) = try_lock()? else {
+        println!(
+            "watch: already running (pid {})",
+            lock_owner().map_or("?".into(), |p| p.to_string())
+        );
+        return Ok(());
+    };
+    println!(
+        "watch: started (pid {}), every {} ms",
+        std::process::id(),
+        interval.as_millis()
+    );
+    if restore_first {
+        if let Err(error) = cmd_restore() {
+            println!("watch: restore failed: {error:#}");
+        }
+    }
+    let mut last_errors: HashMap<String, String> = HashMap::new();
+    loop {
+        if let Some(binary) = installed_binary() {
+            reexec(&binary);
+        }
+        match tick() {
+            Ok(machines) => {
+                print_actions(&machines, true);
+                for m in &machines {
+                    let label = m["machine"].as_str().unwrap_or("?").to_string();
+                    let message = m["error"]["message"].as_str().unwrap_or("").to_string();
+                    if last_errors.get(&label) != Some(&message) {
+                        if !message.is_empty() {
+                            println!("watch: {label}: {message}");
+                        }
+                        last_errors.insert(label, message);
+                    }
+                }
+            }
+            Err(error) => println!("watch: pass failed: {error:#}"),
+        }
+        let _ = io::stdout().flush();
+        std::thread::sleep(interval);
+    }
+}
+
+fn spawn_detached() -> Result<u32> {
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path()?)?;
+    let mut cmd = Command::new(env::current_exe()?);
+    cmd.args(["watch", "--restore-first"])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let child = cmd.spawn().context("start watch")?;
+    Ok(child.id())
+}
+
+fn watch_status() -> Result<Value> {
+    let running = try_lock()?.is_none();
+    Ok(json!({
+        "running": running,
+        "pid": if running { lock_owner() } else { None },
+        "log": log_path()?.display().to_string(),
+    }))
+}
+
+pub(crate) fn cmd_start_watch(args: &[String], json_out: bool) -> Result<()> {
+    if !args.is_empty() {
+        return Err(err(
+            "invalid_args",
+            "usage: herdr-portal start-watch [--json]",
+        ));
+    }
+    let status = watch_status()?;
+    let (started, pid) = if status["running"] == json!(true) {
+        (false, status["pid"].as_u64())
+    } else {
+        let pid = spawn_detached()?;
+        std::thread::sleep(Duration::from_millis(300));
+        (true, Some(u64::from(pid)))
+    };
+    if json_out {
+        return print_json(&json!({"ok": true, "watch": {
+            "started": started, "running": true, "pid": pid, "log": status["log"],
+        }}));
+    }
+    match (started, pid) {
+        (true, Some(pid)) => println!(
+            "Started watch (pid {pid}); log: {}",
+            status["log"].as_str().unwrap_or("")
+        ),
+        (_, pid) => println!(
+            "watch is already running (pid {})",
+            pid.map_or("?".into(), |p| p.to_string())
+        ),
+    }
     Ok(())
+}
+
+pub(crate) fn cmd_watch(args: &[String], json_out: bool) -> Result<()> {
+    let args = parse_args(
+        args,
+        &["--interval"],
+        &["--once", "--restore-first", "--status"],
+    )?;
+    if !args.positional.is_empty() {
+        return Err(err(
+            "invalid_args",
+            "usage: herdr-portal watch [--once | --status] [--restore-first] [--interval MS] [--json]",
+        ));
+    }
+    if args.switches.contains("--status") {
+        let status = watch_status()?;
+        if json_out {
+            return print_json(&json!({"ok": true, "watch": status}));
+        }
+        if status["running"] == json!(true) {
+            println!("watch is running (pid {})", status["pid"]);
+        } else {
+            println!("watch is not running");
+        }
+        return Ok(());
+    }
+    if args.switches.contains("--once") {
+        let machines = tick()?;
+        if json_out {
+            return print_json(&json!({"ok": true, "machines": machines}));
+        }
+        print_actions(&machines, false);
+        return Ok(());
+    }
+    let interval = match args.flags.get("--interval") {
+        Some(ms) => ms
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms >= 250)
+            .map(Duration::from_millis)
+            .ok_or_else(|| {
+                err(
+                    "invalid_args",
+                    "--interval takes milliseconds, at least 250",
+                )
+            })?,
+        None => Duration::from_secs(2),
+    };
+    run_loop(interval, args.switches.contains("--restore-first"))
 }
 
 #[cfg(test)]

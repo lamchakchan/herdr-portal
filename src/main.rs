@@ -126,6 +126,7 @@ fn run(mut args: Vec<String>, json_out: bool) -> Result<()> {
         "release" => requests::cmd_release(&args[1..], json_out),
         "requests" => requests::cmd_requests(&args[1..], json_out),
         "watch" => requests::cmd_watch(&args[1..], json_out),
+        "start-watch" => requests::cmd_start_watch(&args[1..], json_out),
         "restore" => cmd_restore(),
         "open-picker" => cmd_open_picker(&args[1..]),
         "from-url" => cmd_from_url(),
@@ -161,12 +162,14 @@ Agent requests (run in a Herdr pane on the machine where the service listens):
   request <port> [--local-port N | --any] [--pane ID] [--wait SECS]
   release <port> [--pane ID]
   requests [--all | --pane ID]
-  watch --once     on the laptop: open and close forwards that panes ask for
+  watch [--once | --status] [--restore-first] [--interval MS]
+                   on the laptop: open and close forwards that panes ask for
+  start-watch      start watch in the background unless it already runs
 
 Add --json to scan, list, add, stop or start for one JSON object on stdout:
 {{\"ok\": true, ...}} on success, {{\"ok\": false, \"error\": {{\"code\", \"message\"}}}} on failure.
 
-Forwards outlive the picker. Herdr startup runs restore.
+Forwards outlive the picker. Herdr startup runs `watch --restore-first`.
 Select Local in the Herdr sidebar before picking a remote machine.
 "
     );

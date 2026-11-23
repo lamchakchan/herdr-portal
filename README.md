@@ -280,7 +280,20 @@ On the laptop, `herdr-portal watch --once --json` runs one pass over every
 saved machine. It opens forwards for new requests, resumes saved ones, and
 reuses a forward already open on that remote port, including one opened by
 hand. When the request or its pane goes away, it closes only forwards it opened
-itself. A pane closing therefore takes its forwards with it.
+itself. A pane closing therefore takes its forwards with it. A request that
+failed is tried again on every pass, with its answer token left as it is, so
+freeing the local port lets the next pass open it.
+
+`watch` without `--once` keeps doing that every 2 s (`--interval MS`). Herdr
+starts it as the plugin's startup command, `watch --restore-first`, which first
+reopens saved forwards. Only one runs at a time, held by a lock in the state
+directory; a second one exits at once. When the plugin is updated, the running
+`watch` switches to the new binary within one pass, without a Herdr restart.
+Herdr runs startup commands only when its server starts, so after installing
+the plugin, start it once with `herdr-portal start-watch` (or the "Start the
+request watcher" action). `watch --status --json` reports whether it runs, its
+pid and its log, `watch.log` in the state directory.
+
 
 ## Requirements
 
