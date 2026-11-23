@@ -12,13 +12,19 @@ command = ["cargo", "build", "--release"]
 command = ["cp", "target/release/herdr-portal", "herdr-portal"]
 
 [[startup]]
-command = ["./herdr-portal", "restore"]
+command = ["./herdr-portal", "watch", "--restore-first"]
 
 [[actions]]
 id = "pick"
 title = "Pick remote port"
 contexts = ["global", "workspace"]
 command = ["./herdr-portal", "open-picker"]
+
+[[actions]]
+id = "start-watch"
+title = "Start the request watcher"
+contexts = ["global"]
+command = ["./herdr-portal", "start-watch"]
 
 [[actions]]
 id = "list"

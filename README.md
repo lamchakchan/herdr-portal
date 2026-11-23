@@ -205,6 +205,7 @@ return `{"ok": true, "port": {...}}`. Every port has this shape:
   "state": "active",
   "url": "http://herdr.web.localhost:5173",
   "workspace": "web", "workspace_id": "w3", "tab_id": "w3:t1", "pane_id": "w3:p2",
+  "origin": "manual",
   "agent": "claude", "agent_name": null,
   "process": "node", "pid": 4242
 }
@@ -220,7 +221,9 @@ return `{"ok": true, "port": {...}}`. Every port has this shape:
 process ancestry ties the listener to a pane. They're null for detached servers
 matched by directory, and `list` reports only the `pane_id` that `add` saved.
 `scan` rows also keep the fields of the first JSON format: `port`, `saved`,
-`forwarded` and `status`. Asking `add` for a forward that is already active
+`forwarded` and `status`. `origin` says who opened a saved forward: `manual`
+(`add`, the picker or restore), `request` (an agent request) or `auto`; it is
+null for a port that isn't saved. Asking `add` for a forward that is already active
 returns it unchanged.
 
 | Error code | When |
@@ -233,6 +236,98 @@ returns it unchanged.
 | `ssh_failed` | An SSH control command failed. |
 | `herdr_failed` | `herdr` on the target machine failed or wasn't found. |
 | `internal` | Anything else. |
+
+## Agent requests
+
+An agent on the remote machine can ask the laptop for a forward without any
+access to the laptop. It sets a token on its own Herdr pane; `watch` on the
+laptop reads every saved machine's panes, opens the forward, and answers on the
+same pane. Nothing has to be installed on the remote machine.
+
+On the remote machine, inside a Herdr pane:
+
+```sh
+herdr-portal request 5173 --wait 10 --json   # same local port
+herdr-portal request 5173 --any --json       # any free local port
+herdr-portal request 5173 --local-port 6000 --json
+herdr-portal requests --json                 # this pane; --all for every pane
+herdr-portal release 5173 --json
+```
+
+`request` returns `{"ok": true, "request": {...}}` with `status` `pending`
+until the laptop answers, then `active` with `local_port`, `url` and
+`localhost_url`. With `--wait SECS` it waits for that answer. If the laptop
+can't forward the port, the request fails with the laptop's error code, such as
+`local_port_in_use`. Ports below 1024 are refused.
+
+Without the plugin installed there, the same request is two Herdr calls:
+
+```sh
+herdr pane report-metadata "$HERDR_PANE_ID" --source herdr-portal --token portal_req_5173=same@1
+herdr pane get "$HERDR_PANE_ID"   # .result.pane.tokens.portal_st_5173 is active:5173@1
+herdr pane report-metadata "$HERDR_PANE_ID" --source herdr-portal --clear-token portal_req_5173
+```
+
+| Token | Written by | Value |
+| --- | --- | --- |
+| `portal_req_<port>` | the agent, source `herdr-portal` | `same`, `any` or a local port, then `@<nonce>` |
+| `portal_st_<port>` | `watch`, source `herdr-portal-client` | `pending`, `active:<local-port>` or `error:<code>`, then the request's `@<nonce>` |
+
+The nonce is `[0-9a-z]`; an answer counts only when its nonce matches the
+request, so a new request never reads an old answer.
+
+On the laptop, `herdr-portal watch --once --json` runs one pass over every
+saved machine. It opens forwards for new requests, resumes saved ones, and
+reuses a forward already open on that remote port, including one opened by
+hand. When the request or its pane goes away, it closes only forwards it opened
+itself. A pane closing therefore takes its forwards with it. A request that
+failed is tried again on every pass, with its answer token left as it is, so
+freeing the local port lets the next pass open it.
+
+`watch` without `--once` keeps doing that every 2 s (`--interval MS`). Herdr
+starts it as the plugin's startup command, `watch --restore-first`, which first
+reopens saved forwards. Only one runs at a time, held by a lock in the state
+directory; a second one exits at once. When the plugin is updated, the running
+`watch` switches to the new binary within one pass, without a Herdr restart.
+Herdr runs startup commands only when its server starts, so after installing
+the plugin, start it once with `herdr-portal start-watch` (or the "Start the
+request watcher" action). `watch --status --json` reports whether it runs, its
+pid and its log, `watch.log` in the state directory. Herdr doesn't restart a
+watcher that crashed or was killed until its server next starts; run
+`start-watch` again.
+
+
+## Auto-forward
+
+Off by default. With it on, `watch` forwards every remote listener that a
+Herdr pane started, as VS Code does, on the same port number. Rules live in
+`config.toml` in the plugin's config directory
+(`~/.config/herdr/plugins/config/lamchakchan.herdr-portal/`, or
+`$HERDR_PLUGIN_CONFIG_DIR`), and each pass reads them again:
+
+```toml
+[auto]
+enabled = true
+machines = ["dell-pro-max"]      # saved machine labels or ids; empty = all
+workspaces = ["monitors"]        # workspace labels or ids; empty = all
+ports = [10350, "3000-4999"]     # ports or "low-high" ranges; empty = 1024 and up
+skip = [4200]                    # never auto-forward these
+```
+
+- Only listeners tied to a pane through process ancestry count; detached
+  servers and ports below 1024 never do.
+- A port is never renumbered. If the local port is taken, the row is
+  `auto-skip` with the error code, logged once, and tried again on later passes.
+- Auto runs every 5 s, after the request pass. It never touches forwards
+  opened by hand or by a request, and a port an agent has requested is never
+  auto-stopped.
+- An auto forward closes after its listener has been gone for two scans in a
+  row, or once the rules stop allowing it, including `enabled = false`.
+- If `config.toml` doesn't parse, auto does nothing until it's fixed, and
+  forwards it already opened stay open. `watch --status --json` shows whether
+  auto is on, the config path and the error; the log has the error once, and
+  `auto config: ok again` when it clears.
+- Log lines start with the UTC time of day.
 
 ## Requirements
 
