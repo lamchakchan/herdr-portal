@@ -11,6 +11,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod api;
 mod picker;
 mod sharing;
 
@@ -33,12 +34,18 @@ struct Listener {
     pid: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct WorkspacePort {
     workspace_id: String,
     workspace_label: String,
     port: u16,
     process: String,
+    // Set only when process ancestry ties the listener to a pane.
+    tab_id: Option<String>,
+    pane_id: Option<String>,
+    agent: Option<String>,
+    agent_name: Option<String>,
+    pid: Option<u32>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -50,6 +57,8 @@ struct Forward {
     local_port: u16,
     #[serde(default)]
     workspace_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pane_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -68,14 +77,20 @@ fn default_true() -> bool {
 }
 
 fn main() {
-    if let Err(err) = run() {
-        eprintln!("{err:#}");
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    let json_out = args.iter().any(|a| a == "--json");
+    args.retain(|a| a != "--json");
+    if let Err(err) = run(args, json_out) {
+        if json_out {
+            println!("{}", api::error_json(&err));
+        } else {
+            eprintln!("{err:#}");
+        }
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
-    let mut args: Vec<String> = env::args().skip(1).collect();
+fn run(mut args: Vec<String>, json_out: bool) -> Result<()> {
     if args.is_empty() {
         print_help();
         return Ok(());
@@ -88,11 +103,12 @@ fn run() -> Result<()> {
         }
     }
     match args[0].as_str() {
-        "scan" => cmd_scan(&args[1..]),
+        "scan" => api::cmd_scan(&args[1..], json_out),
         "pick" => picker::run(&args[1..]),
-        "add" => cmd_add(&args[1..]),
-        "list" => cmd_list(),
-        "stop" => cmd_stop(&args[1..]),
+        "add" => api::cmd_add(&args[1..], json_out),
+        "list" => api::cmd_list(&args[1..], json_out),
+        "stop" => api::cmd_stop(&args[1..], json_out),
+        "start" => api::cmd_start(&args[1..], json_out),
         "restore" => cmd_restore(),
         "open-picker" => cmd_open_picker(&args[1..]),
         "from-url" => cmd_from_url(),
@@ -101,8 +117,10 @@ fn run() -> Result<()> {
             Ok(())
         }
         other => {
-            print_help();
-            bail!("unknown command {other}");
+            if !json_out {
+                print_help();
+            }
+            Err(api::err("invalid_args", format!("unknown command {other}")))
         }
     }
 }
@@ -113,12 +131,17 @@ fn print_help() {
 
   URL: http://herdr.{{workspace}}.localhost:{{port}}
 
-  scan [Local|machine] [--json]
+  scan <Local|machine> [--pane ID] [--agent PANE|NAME] [--workspace ID|LABEL]
+       [--state active|inactive|available]
   pick [--port N] [Local|machine]
-  add <machine> <port> [--local-port N] [--workspace NAME] [--open]
-  list
-  stop <local-port>
+  add <machine> <port> [--local-port N] [--workspace NAME] [--pane ID] [--open]
+  list [--state active|inactive]
+  stop <local-port> [--keep]
+  start <local-port>
   restore
+
+Add --json to scan, list, add, stop or start for one JSON object on stdout:
+{{\"ok\": true, ...}} on success, {{\"ok\": false, \"error\": {{\"code\", \"message\"}}}} on failure.
 
 Forwards outlive the picker. Herdr startup runs restore.
 Select Local in the Herdr sidebar before picking a remote machine.
@@ -170,7 +193,13 @@ fn workspace_url(label: &str, port: u16) -> String {
 fn state_dir() -> Result<PathBuf> {
     let path = match env::var_os("HERDR_PLUGIN_STATE_DIR") {
         Some(value) => PathBuf::from(value),
-        None => home_dir()?.join(".local/share/herdr-ports"),
+        // Same directory herdr passes the plugin, so shell runs and the popup share state.
+        None => match env::var_os("XDG_STATE_HOME") {
+            Some(base) if !base.is_empty() => PathBuf::from(base),
+            _ => home_dir()?.join(".local/state"),
+        }
+        .join("herdr/plugins")
+        .join(PLUGIN_ID),
     };
     fs::create_dir_all(path.join("ssh"))?;
     Ok(path)
@@ -266,7 +295,10 @@ fn resolve_machine(selector: &str) -> Result<Machine> {
         .collect();
     match matches.len() {
         1 => Ok(matches.into_iter().next().unwrap()),
-        0 => bail!("Unknown machine '{selector}'. Use Local or `herdr machine list`."),
+        0 => Err(api::err(
+            "machine_not_found",
+            format!("Unknown machine '{selector}'. Use Local or `herdr machine list`."),
+        )),
         _ => bail!("Machine '{selector}' is ambiguous; use the profile id."),
     }
 }
@@ -487,7 +519,7 @@ fn herdr_argv(machine: &Machine, args: &[&str]) -> Vec<String> {
     let mut cmd = vec![if is_local(machine) {
         herdr_bin()
     } else {
-        "herdr".into()
+        env::var("HERDR_PORTAL_REMOTE_HERDR").unwrap_or_else(|_| "herdr".into())
     }];
     if !is_local(machine) && !machine.session.is_empty() {
         cmd.extend(["--session".into(), machine.session.clone()]);
@@ -506,14 +538,12 @@ fn herdr_result(machine: &Machine, args: &[&str]) -> Result<Value> {
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_on(machine, &refs, None)?;
     if code != 0 {
-        bail!(
-            "{}",
-            if stderr.trim().is_empty() {
-                stdout.trim()
-            } else {
-                stderr.trim()
-            }
-        );
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(api::err("herdr_failed", detail.to_string()));
     }
     let payload = parse_json_blob(&stdout)?;
     Ok(payload.get("result").cloned().unwrap_or(payload))
@@ -588,6 +618,14 @@ fn ancestors(pid: u32, parents: &HashMap<u32, u32>) -> HashSet<u32> {
     seen
 }
 
+#[derive(Clone, Debug, Default)]
+struct PaneRef {
+    tab_id: Option<String>,
+    pane_id: String,
+    agent: Option<String>,
+    agent_name: Option<String>,
+}
+
 fn attribute_ports(machine: &Machine, listeners: &[Listener]) -> Result<Vec<WorkspacePort>> {
     let parents = pid_parent_map(machine)?;
     let workspaces = herdr_result(machine, &["workspace", "list"])?;
@@ -602,8 +640,24 @@ fn attribute_ports(machine: &Machine, listeners: &[Listener]) -> Result<Vec<Work
             }
         }
     }
+    let mut agent_names = HashMap::new();
+    if let Ok(agents) = herdr_result(machine, &["agent", "list"]) {
+        for row in agents
+            .get("agents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(pane), Some(name)) = (
+                row.get("pane_id").and_then(Value::as_str),
+                row.get("name").and_then(Value::as_str),
+            ) {
+                agent_names.insert(pane.to_string(), name.to_string());
+            }
+        }
+    }
     let panes = herdr_result(machine, &["pane", "list"])?;
-    let mut pane_index: Vec<(HashSet<u32>, String, String)> = Vec::new();
+    let mut pane_index: Vec<(HashSet<u32>, String, PaneRef)> = Vec::new();
     let mut workspace_paths = Vec::new();
     if let Some(rows) = panes.get("panes").and_then(Value::as_array) {
         for pane in rows {
@@ -638,11 +692,19 @@ fn attribute_ports(machine: &Machine, listeners: &[Listener]) -> Result<Vec<Work
                     }
                 }
             }
-            let label = labels
-                .get(&workspace_id)
-                .cloned()
-                .unwrap_or_else(|| workspace_id.clone());
-            pane_index.push((pids, workspace_id, label));
+            let pane_ref = PaneRef {
+                tab_id: pane
+                    .get("tab_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                pane_id: pane_id.to_string(),
+                agent: pane
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                agent_name: agent_names.get(pane_id).cloned(),
+            };
+            pane_index.push((pids, workspace_id, pane_ref));
         }
     }
     let mut found = Vec::new();
@@ -654,6 +716,7 @@ fn attribute_ports(machine: &Machine, listeners: &[Listener]) -> Result<Vec<Work
         let matched = pane_index
             .iter()
             .find(|(pids, _, _)| !pids.is_disjoint(&tree));
+        let pane_ref = matched.map(|(_, _, pane)| pane.clone());
         let workspace_id = if let Some((_, id, _)) = matched {
             Some(id.clone())
         } else {
@@ -668,11 +731,17 @@ fn attribute_ports(machine: &Machine, listeners: &[Listener]) -> Result<Vec<Work
         if !seen.insert((workspace_id.clone(), listener.port)) {
             continue;
         }
+        let pane_ref = pane_ref.unwrap_or_default();
         found.push(WorkspacePort {
             workspace_id: workspace_id.clone(),
             workspace_label: label.clone(),
             port: listener.port,
             process: listener.process.clone(),
+            tab_id: pane_ref.tab_id,
+            pane_id: (!pane_ref.pane_id.is_empty()).then_some(pane_ref.pane_id),
+            agent: pane_ref.agent,
+            agent_name: pane_ref.agent_name,
+            pid: Some(pid),
         });
     }
     found.sort_by(|a, b| {
@@ -846,6 +915,8 @@ fn merge_forwarded_ports(
                 workspace_label: label,
                 port: fwd.remote_port,
                 process: "forwarded".into(),
+                pane_id: fwd.pane_id.clone(),
+                ..Default::default()
             });
         }
     }
@@ -857,11 +928,16 @@ fn add_forward(
     remote_port: u16,
     local_port: Option<u16>,
     workspace_label: &str,
+    pane_id: Option<&str>,
 ) -> Result<Forward> {
     let local_port = local_port.unwrap_or(remote_port);
     if let Some(holder) = local_port_holder(local_port) {
-        bail!("Local port {local_port} is held by {holder}. Pass --local-port PORT.");
+        return Err(api::err(
+            "local_port_in_use",
+            format!("Local port {local_port} is held by {holder}. Pass --local-port PORT."),
+        ));
     }
+    let pane_id = pane_id.map(str::to_string);
     if is_local(machine) {
         let forward = Forward {
             machine_id: machine.id.clone(),
@@ -870,6 +946,7 @@ fn add_forward(
             remote_port,
             local_port,
             workspace_label: workspace_label.to_string(),
+            pane_id,
         };
         let mut items = load_forwards()?;
         items.retain(|item| !(item.machine_id == LOCAL_ID && item.local_port == local_port));
@@ -889,7 +966,7 @@ fn add_forward(
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, _, stderr) = run_cmd(&refs, None)?;
     if code != 0 {
-        bail!(stderr.trim().to_string());
+        return Err(api::err("ssh_failed", stderr.trim().to_string()));
     }
     let mut items = load_forwards()?;
     items.retain(|item| !(item.target == machine.target && item.local_port == local_port));
@@ -900,20 +977,25 @@ fn add_forward(
         remote_port,
         local_port,
         workspace_label: workspace_label.to_string(),
+        pane_id,
     };
     items.push(forward.clone());
     save_forwards(&items)?;
     Ok(forward)
 }
 
-fn stop_forward(local_port: u16) -> Result<()> {
+// With `keep`, the forward stays saved (inactive) so `start` or `restore` can resume it.
+fn stop_forward(local_port: u16, keep: bool) -> Result<Forward> {
     let items = load_forwards()?;
     let Some(matched) = items
         .iter()
         .find(|item| item.local_port == local_port)
         .cloned()
     else {
-        bail!("No tracked forward on local port {local_port}");
+        return Err(api::err(
+            "no_forward",
+            format!("No tracked forward on local port {local_port}"),
+        ));
     };
     if !matched.target.is_empty() {
         let mut args = ssh_base(&matched.target)?;
@@ -927,15 +1009,20 @@ fn stop_forward(local_port: u16) -> Result<()> {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (code, _, stderr) = run_cmd(&refs, None)?;
         if code != 0 && forward_alive(&matched)? {
-            bail!("Cannot stop forward: {}", stderr.trim());
+            return Err(api::err(
+                "ssh_failed",
+                format!("Cannot stop forward: {}", stderr.trim()),
+            ));
         }
     }
-    let rest: Vec<_> = items
-        .into_iter()
-        .filter(|item| item.local_port != local_port)
-        .collect();
-    save_forwards(&rest)?;
-    Ok(())
+    if !keep {
+        let rest: Vec<_> = items
+            .into_iter()
+            .filter(|item| item.local_port != local_port)
+            .collect();
+        save_forwards(&rest)?;
+    }
+    Ok(matched)
 }
 
 fn open_browser(url: &str) -> Result<()> {
@@ -998,135 +1085,6 @@ fn load_workspaces(machine: &Machine) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-fn cmd_scan(args: &[String]) -> Result<()> {
-    let json_out = args.iter().any(|a| a == "--json");
-    let selector = args.iter().find(|a| a.as_str() != "--json");
-    let Some(selector) = selector else {
-        bail!("scan [Local|machine]");
-    };
-    let machine = resolve_machine(selector)?;
-    let ports = merge_forwarded_ports(
-        &machine,
-        attribute_ports(&machine, &scan_listeners(&machine)?)?,
-    )?;
-    if json_out {
-        let rows: Vec<Value> = ports
-            .iter()
-            .map(|item| -> Result<Value> {
-                let forward = existing_forward(&machine, item.port)?;
-                let status = forward_symbol(forward.as_ref())?;
-                let local_port = forward.as_ref().map_or(item.port, |f| f.local_port);
-                Ok(json!({
-                    "workspace": item.workspace_label,
-                    "port": item.port,
-                    "process": item.process,
-                    "url": workspace_url(&item.workspace_label, local_port),
-                    "saved": forward.is_some(),
-                    "forwarded": status == "●",
-                    "status": status,
-                }))
-            })
-            .collect::<Result<_>>()?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({"machine": machine.label, "ports": rows}))?
-        );
-        return Ok(());
-    }
-    println!("{}", format_ports(&machine, &ports)?);
-    Ok(())
-}
-
-fn cmd_list() -> Result<()> {
-    let items = load_forwards()?;
-    if items.is_empty() {
-        println!("No tracked forwards.");
-        return Ok(());
-    }
-    println!("{:<4}{:<8}{:<8}URL", "ST", "LOCAL", "REMOTE");
-    for item in items {
-        let label = if item.workspace_label.is_empty() {
-            &item.label
-        } else {
-            &item.workspace_label
-        };
-        println!(
-            "{:<4}{:<8}{:<8}{}",
-            forward_symbol(Some(&item))?,
-            item.local_port,
-            item.remote_port,
-            workspace_url(label, item.local_port)
-        );
-    }
-    Ok(())
-}
-
-fn cmd_add(args: &[String]) -> Result<()> {
-    if args.len() < 2 {
-        bail!(
-            "usage: herdr-portal add <machine> <port> [--local-port N] [--workspace NAME] [--open]"
-        );
-    }
-    let selector = &args[0];
-    let remote_port: u16 = args[1].parse()?;
-    let mut local_port = None;
-    let mut workspace = String::new();
-    let mut open = false;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--local-port" if i + 1 < args.len() => {
-                local_port = Some(args[i + 1].parse()?);
-                i += 2;
-            }
-            "--workspace" if i + 1 < args.len() => {
-                workspace = args[i + 1].clone();
-                i += 2;
-            }
-            "--open" => {
-                open = true;
-                i += 1;
-            }
-            other => bail!("unknown argument {other}"),
-        }
-    }
-    let machine = resolve_machine(selector)?;
-    if workspace.is_empty() {
-        if let Ok(ports) = attribute_ports(&machine, &scan_listeners(&machine)?) {
-            if let Some(item) = ports.iter().find(|p| p.port == remote_port) {
-                workspace = item.workspace_label.clone();
-            }
-        }
-    }
-    let forward = add_forward(&machine, remote_port, local_port, &workspace)?;
-    let url = workspace_url(
-        if workspace.is_empty() {
-            &machine.label
-        } else {
-            &workspace
-        },
-        forward.local_port,
-    );
-    println!(
-        "Forwarded {}:{} -> {url}",
-        machine.label, forward.remote_port
-    );
-    if open {
-        open_browser(&url)?;
-    }
-    Ok(())
-}
-
-fn cmd_stop(args: &[String]) -> Result<()> {
-    if args.len() != 1 {
-        bail!("usage: herdr-portal stop <local-port>");
-    }
-    let port: u16 = args[0].parse()?;
-    stop_forward(port)?;
-    println!("Stopped local port {port}");
-    Ok(())
-}
-
 fn cmd_restore() -> Result<()> {
     let items = load_forwards()?;
     if items.is_empty() {
@@ -1166,7 +1124,10 @@ fn restore_one(item: &Forward) -> Result<()> {
     }
     ensure_master(&item.target)?;
     if let Some(holder) = local_port_holder(item.local_port) {
-        bail!("Local port {} is held by {holder}.", item.local_port);
+        return Err(api::err(
+            "local_port_in_use",
+            format!("Local port {} is held by {holder}.", item.local_port),
+        ));
     }
     let mut args = ssh_base(&item.target)?;
     args.extend([
@@ -1179,7 +1140,7 @@ fn restore_one(item: &Forward) -> Result<()> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, _, stderr) = run_cmd(&refs, None)?;
     if code != 0 {
-        bail!(stderr.trim().to_string());
+        return Err(api::err("ssh_failed", stderr.trim().to_string()));
     }
     Ok(())
 }

@@ -212,7 +212,7 @@ fn toggle(machine: &Machine, port: &WorkspacePort) -> Result<String> {
     }
     if let Some(saved) = existing_forward(machine, port.port)? {
         if forward_alive(&saved)? {
-            stop_forward(saved.local_port)?;
+            stop_forward(saved.local_port, false)?;
             return Ok("Forward stopped".into());
         }
         restore_one(&saved)?;
@@ -226,7 +226,13 @@ fn toggle(machine: &Machine, port: &WorkspacePort) -> Result<String> {
     } else {
         port.port
     };
-    add_forward(machine, port.port, Some(local), &port.workspace_label)?;
+    add_forward(
+        machine,
+        port.port,
+        Some(local),
+        &port.workspace_label,
+        port.pane_id.as_deref(),
+    )?;
     Ok(format!(
         "Forward started: {}",
         workspace_url(&port.workspace_label, local)
