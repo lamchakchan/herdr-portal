@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 mod api;
+mod auto;
 mod picker;
 mod requests;
 mod sharing;

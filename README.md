@@ -292,8 +292,39 @@ directory; a second one exits at once. When the plugin is updated, the running
 Herdr runs startup commands only when its server starts, so after installing
 the plugin, start it once with `herdr-portal start-watch` (or the "Start the
 request watcher" action). `watch --status --json` reports whether it runs, its
-pid and its log, `watch.log` in the state directory.
+pid and its log, `watch.log` in the state directory. Herdr doesn't restart a
+watcher that crashed or was killed until its server next starts; run
+`start-watch` again.
 
+
+## Auto-forward
+
+Off by default. With it on, `watch` forwards every remote listener that a
+Herdr pane started, as VS Code does, on the same port number. Rules live in
+`config.toml` in the plugin's config directory
+(`~/.config/herdr/plugins/config/lamchakchan.herdr-portal/`, or
+`$HERDR_PLUGIN_CONFIG_DIR`), and each pass reads them again:
+
+```toml
+[auto]
+enabled = true
+machines = ["dell-pro-max"]      # saved machine labels or ids; empty = all
+workspaces = ["monitors"]        # workspace labels or ids; empty = all
+ports = [10350, "3000-4999"]     # ports or "low-high" ranges; empty = 1024 and up
+skip = [4200]                    # never auto-forward these
+```
+
+- Only listeners tied to a pane through process ancestry count; detached
+  servers and ports below 1024 never do.
+- A port is never renumbered. If the local port is taken, the row is
+  `auto-skip` with the error code, logged once, and tried again on later passes.
+- Auto runs every 5 s, after the request pass. It never touches forwards
+  opened by hand or by a request, and a port an agent has requested is never
+  auto-stopped.
+- An auto forward closes after its listener has been gone for two scans in a
+  row, or once the rules stop allowing it, including `enabled = false`.
+- `watch --status --json` shows whether auto is on, the config path, and the
+  error if the file doesn't parse.
 
 ## Requirements
 

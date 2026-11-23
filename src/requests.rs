@@ -11,6 +11,7 @@ const ST_SOURCE: &str = "herdr-portal-client";
 const REQ_PREFIX: &str = "portal_req_";
 const ST_PREFIX: &str = "portal_st_";
 const MIN_PORT: u16 = 1024;
+const AUTO_EVERY: Duration = Duration::from_secs(5);
 const KNOWN_CODES: &[&str] = &[
     "invalid_args",
     "machine_not_found",
@@ -239,7 +240,7 @@ fn clear_token(machine: &Machine, pane: &str, source: &str, key: &str) -> Result
     report_metadata(machine, pane, source, "--clear-token", key)
 }
 
-fn error_code(error: &anyhow::Error) -> String {
+pub(crate) fn error_code(error: &anyhow::Error) -> String {
     api::error_json(error)["error"]["code"]
         .as_str()
         .unwrap_or("internal")
@@ -464,12 +465,12 @@ fn free_local_port() -> Result<u16> {
     Ok(TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
 }
 
-fn same_machine(forward: &Forward, machine: &Machine) -> bool {
+pub(crate) fn same_machine(forward: &Forward, machine: &Machine) -> bool {
     forward.machine_id == machine.id
         || (!machine.target.is_empty() && forward.target == machine.target)
 }
 
-fn mark_origin(machine: &Machine, local_port: u16, origin: Origin) -> Result<()> {
+pub(crate) fn mark_origin(machine: &Machine, local_port: u16, origin: Origin) -> Result<()> {
     let mut items = load_forwards()?;
     for item in items.iter_mut() {
         if same_machine(item, machine) && item.local_port == local_port {
@@ -531,7 +532,7 @@ fn satisfy(
     }
 }
 
-fn tick_machine(machine: &Machine) -> Result<Vec<Value>> {
+fn tick_machine(machine: &Machine) -> Result<(Vec<Value>, HashSet<u16>)> {
     let result = herdr_result(machine, &["pane", "list"])?;
     let panes = panes_of(&result);
     let labels = load_workspaces(machine).unwrap_or_default();
@@ -596,13 +597,31 @@ fn tick_machine(machine: &Machine) -> Result<Vec<Value>> {
             let _ = clear_token(machine, &pane_id, ST_SOURCE, &format!("{ST_PREFIX}{port}"));
         }
     }
-    Ok(actions)
+    Ok((actions, wanted))
 }
 
-fn tick() -> Result<Vec<Value>> {
+/// One pass over every saved machine: agent requests always, auto-forward
+/// when `with_auto`, closing auto forwards the `[auto]` rules no longer allow.
+fn tick(with_auto: bool) -> Result<Vec<Value>> {
+    let auto_config = if with_auto {
+        Some(auto::load_config())
+    } else {
+        None
+    };
     let mut out = Vec::new();
     for machine in load_machines()? {
-        match tick_machine(&machine) {
+        let result = tick_machine(&machine).and_then(|(mut actions, wanted)| {
+            match &auto_config {
+                // Disabled still runs, so auto forwards close once auto is turned off.
+                Some(Ok(config)) => {
+                    actions.extend(auto::tick_machine(&machine, config, &wanted)?);
+                }
+                Some(Err(error)) => return Err(anyhow!("{error:#}")),
+                _ => {}
+            }
+            Ok(actions)
+        });
+        match result {
             Ok(actions) => out.push(json!({
                 "machine": machine.label,
                 "machine_id": machine.id,
@@ -727,11 +746,16 @@ fn run_loop(interval: Duration, restore_first: bool) -> Result<()> {
         }
     }
     let mut last_errors: HashMap<String, String> = HashMap::new();
+    let mut last_auto: Option<Instant> = None;
     loop {
         if let Some(binary) = installed_binary() {
             reexec(&binary);
         }
-        match tick() {
+        let with_auto = last_auto.is_none_or(|t| t.elapsed() >= AUTO_EVERY);
+        if with_auto {
+            last_auto = Some(Instant::now());
+        }
+        match tick(with_auto) {
             Ok(machines) => {
                 print_actions(&machines, true);
                 for m in &machines {
@@ -779,10 +803,19 @@ fn spawn_detached() -> Result<u32> {
 
 fn watch_status() -> Result<Value> {
     let running = try_lock()?.is_none();
+    let auto = match auto::load_config() {
+        Ok(config) => {
+            json!({"enabled": config.enabled, "config": auto::config_path()?.display().to_string(), "error": null})
+        }
+        Err(error) => {
+            json!({"enabled": false, "config": auto::config_path()?.display().to_string(), "error": format!("{error:#}")})
+        }
+    };
     Ok(json!({
         "running": running,
         "pid": if running { lock_owner() } else { None },
         "log": log_path()?.display().to_string(),
+        "auto": auto,
     }))
 }
 
@@ -844,7 +877,7 @@ pub(crate) fn cmd_watch(args: &[String], json_out: bool) -> Result<()> {
         return Ok(());
     }
     if args.switches.contains("--once") {
-        let machines = tick()?;
+        let machines = tick(true)?;
         if json_out {
             return print_json(&json!({"ok": true, "machines": machines}));
         }
