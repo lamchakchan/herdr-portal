@@ -217,6 +217,11 @@ fn rounds(doc: &Value) -> Vec<(String, u64)> {
 
 const DAY: u64 = 86_400;
 
+/// Root ignores permission bits, so a test that needs a denied directory can't run as root.
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1077,4 +1082,140 @@ fn an_unknown_command_is_invalid_args_as_history_is_on_an_older_portal() {
     assert!(!out.status.success());
     let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(doc["error"]["code"], "invalid_args", "{doc}");
+}
+
+/// A dangling month link is never read and still clears `complete` (1183): it isn't a file, but it is an entry.
+#[test]
+fn a_dangling_month_link_alone_clears_complete() {
+    use std::os::unix::fs::symlink;
+    for (name, remote) in [("dangling-local", false), ("dangling-remote", true)] {
+        let fixture = Fixture::new(name);
+        let dir = if remote {
+            fixture.remote_history()
+        } else {
+            fixture.history()
+        };
+        let t = now();
+        put(&dir, t, &fix_line("q-real", t - 60, 1));
+        symlink(
+            fixture.dir.join("nowhere.jsonl"),
+            dir.join(month_of(t - 32 * DAY)),
+        )
+        .unwrap();
+        let since = (t - 60 * DAY).to_string();
+        let (ok, doc) = fixture.read(
+            &[if remote { "devbox" } else { "Local" }, "--since", &since],
+            &[],
+        );
+        assert!(ok, "{name}: {doc}");
+        assert_eq!(rounds(&doc), [("q-real".to_string(), 1)], "{name}: {doc}");
+        assert_eq!(doc["complete"], false, "{name}: {doc}");
+    }
+}
+
+/// A history that can't be listed or searched, or that is a file or a FIFO, fails the same way on both sides (1183), never as an
+/// empty and complete one.
+#[test]
+fn an_unreadable_history_or_one_that_is_a_file_or_a_fifo_is_internal_on_both_sides() {
+    if is_root() {
+        return;
+    }
+    for (case, remote) in [
+        ("unreadable", false),
+        ("unreadable", true),
+        ("unsearchable", false),
+        ("unsearchable", true),
+        ("unlistable", false),
+        ("unlistable", true),
+        ("file", false),
+        ("file", true),
+        ("fifo", false),
+        ("fifo", true),
+    ] {
+        let name = format!("odd-dir-{case}-{}", if remote { "remote" } else { "local" });
+        let fixture = Fixture::new(&name);
+        let dir = if remote {
+            fixture.remote_history()
+        } else {
+            fixture.history()
+        };
+        match case {
+            "unreadable" | "unsearchable" | "unlistable" => {
+                put(&dir, now(), &fix_line("q-hidden", now() - 60, 1));
+                let mode = match case {
+                    "unreadable" => 0o000,
+                    "unsearchable" => 0o400,
+                    _ => 0o100,
+                };
+                fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            "file" => {
+                fs::create_dir_all(dir.parent().unwrap()).unwrap();
+                fs::write(&dir, fix_line("q-hidden", now() - 60, 1)).unwrap();
+                // Readable and executable, so only its not being a directory refuses it.
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            _ => {
+                fs::create_dir_all(dir.parent().unwrap()).unwrap();
+                assert!(Command::new("mkfifo").arg(&dir).status().unwrap().success());
+            }
+        }
+        let (ok, doc) = fixture.read(&[if remote { "devbox" } else { "Local" }], &[]);
+        if case != "file" && case != "fifo" {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(!ok, "{name}: {doc}");
+        assert_eq!(doc["error"]["code"], "internal", "{name}: {doc}");
+        assert!(!doc.to_string().contains("q-hidden"), "{name}: {doc}");
+    }
+}
+
+/// A missing history behind a parent that can't be searched can't be told from an empty one, so it fails as internal
+/// on both sides (1186), with the fixed message and no OS error text. Over ssh the parent can be further up. A
+/// parent that can be searched but not listed still shows the history is missing: empty and complete.
+#[test]
+fn a_history_behind_an_unsearchable_parent_is_internal_on_both_sides() {
+    if is_root() {
+        return;
+    }
+    for (mode, up, remote) in [
+        (0o600, 1, false),
+        (0o600, 1, true),
+        (0o000, 1, false),
+        (0o000, 1, true),
+        (0o600, 2, true),
+        (0o300, 1, false),
+        (0o300, 1, true),
+    ] {
+        let side = if remote { "remote" } else { "local" };
+        let name = format!("odd-parent-{mode:o}-{up}-{side}");
+        let fixture = Fixture::new(&name);
+        let dir = if remote {
+            fixture.remote_history()
+        } else {
+            fixture.history()
+        };
+        let parent = dir.ancestors().nth(up).unwrap().to_path_buf();
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(mode)).unwrap();
+        let (ok, doc) = fixture.read(&[if remote { "devbox" } else { "Local" }], &[]);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        if mode == 0o300 {
+            assert!(ok, "{name}: {doc}");
+            assert_eq!(doc["events"], serde_json::json!([]), "{name}: {doc}");
+            assert_eq!(doc["complete"], true, "{name}: {doc}");
+            continue;
+        }
+        assert!(!ok, "{name}: {doc}");
+        assert_eq!(doc["error"]["code"], "internal", "{name}: {doc}");
+        assert_eq!(
+            doc["error"]["message"], "The history read on the machine failed.",
+            "{name}: {doc}"
+        );
+        let text = doc.to_string();
+        assert!(
+            !text.contains("os error") && !text.contains("denied"),
+            "{name}: {doc}"
+        );
+    }
 }

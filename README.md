@@ -402,7 +402,9 @@ there.
   - more than 2 MiB of files: the newest months are read first, and the oldest file read loses its front;
   - more than 10,000 events: the newest are kept;
   - a month-named entry that is a link, a FIFO, a directory or anything but a regular file is never read.
-- A `history` directory that is a link fails with `internal`, as it does for `event`.
+- A `history` that is a link, not a directory, or can't be listed or searched fails with `internal` (on both sides),
+  and so does a missing one behind a parent that can't be searched; a missing one is otherwise empty and
+  `complete: true`.
 - Over SSH, the script reads the default state directory only. It doesn't see `HERDR_PLUGIN_STATE_DIR`, which herdr
   sets only for its own plugin runs, so a machine whose herdr uses another state directory reads as having no history.
   `progress` has the same limit.

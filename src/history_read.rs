@@ -34,9 +34,11 @@ const TEXTS: ReadTexts = ReadTexts {
 /// Prints `NOW`, then for each month file at or after the month `$1`, newest first: `FILE <name> <bytes> <cut>`, the
 /// file's bytes in base64, `END`. A file larger than what is left of the budget sends its newest bytes, cut=1, and
 /// ends the read with `CAP`. A month-named entry that is a link or not a regular file (a FIFO, a directory) is never
-/// read and prints `SKIP`; a history directory that is a link prints `BAD` (1181). The files come from a glob, not
-/// `ls`, so no other name can stand for a month's. It reads herdr-portal's default state directory, and writes
-/// nothing.
+/// read and prints `SKIP`; a history directory that is a link, not a directory, or can't be listed or searched
+/// prints `BAD` (1181, 1183), and so does a missing one whose nearest existing parent can't be searched, since then
+/// it can't be told from an empty one (1186). The files come from a glob, not `ls`, so no other name can stand for a
+/// month's. It
+/// reads herdr-portal's default state directory, and writes nothing.
 pub(crate) const SCRIPT: &str = r#"
 set -u
 export LC_ALL=C
@@ -46,7 +48,13 @@ case "$m" in [0-9][0-9][0-9][0-9]-[0-9][0-9]) ;; *) printf 'BAD\n'; exit 0 ;; es
 printf 'NOW\t%s\n' "$(date +%s)"
 d="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/lamchakchan.herdr-portal/history"
 if [ -L "$d" ]; then printf 'BAD\n'; exit 0; fi
-[ -d "$d" ] || exit 0
+if [ ! -e "$d" ]; then
+  p=${d%/*}
+  while [ ! -e "$p" ] && [ "$p" != "${p%/*}" ]; do p=${p%/*}; done
+  if [ ! -x "$p" ]; then printf 'BAD\n'; fi
+  exit 0
+fi
+if [ ! -d "$d" ] || [ ! -r "$d" ] || [ ! -x "$d" ]; then printf 'BAD\n'; exit 0; fi
 total=0
 files=("$d"/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl)
 for ((i = ${#files[@]} - 1; i >= 0; i--)); do
@@ -110,8 +118,11 @@ fn read_local(since: u64) -> Result<Found> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| err("internal", "The clock is before 1970."))?
         .as_secs();
+    // A state directory that can't be made or opened is a history that can't be read (1186): the fixed message,
+    // never the OS error.
+    let state = state_dir().map_err(|_| err("internal", HISTORY_FAILED))?;
     let mut out = read_files(
-        &state_dir()?.join("history"),
+        &state.join("history"),
         &format!("{}.jsonl", first_month(since)),
         READ_CAP,
     )?;
@@ -119,8 +130,16 @@ fn read_local(since: u64) -> Result<Found> {
     Ok(out)
 }
 
+/// Whether this process may open names in `dir` (search permission), as the script's `[ -x ]` asks.
+fn searchable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0)
+}
+
 /// The month files in `dir` from `first` on, newest first, within `cap` bytes. A missing `dir` is empty; a `dir`
-/// that is a link or not a directory is refused, as the writer refuses it (1181).
+/// that is a link or not a directory is refused, as the writer refuses it (1181), and so is one that can't be listed
+/// or searched (1183), or whose state directory can't be made or opened (1186): it is never answered as empty and complete.
 ///
 /// Each file is opened without following a link and without blocking, then must be a regular file: a FIFO, a
 /// directory or a link is skipped and the read is incomplete. Reading a FIFO would wait for a writer forever.
@@ -142,9 +161,10 @@ fn read_files(dir: &Path, first: &str, cap: usize) -> Result<Found> {
         }
         Ok(_) => {}
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(out);
-    };
+    let entries = fs::read_dir(dir)
+        .ok()
+        .filter(|_| searchable(dir))
+        .ok_or_else(|| err_with("internal", HISTORY_FAILED, "history can't be listed"))?;
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter(|n| is_month_file(n) && n.as_str() >= first)
