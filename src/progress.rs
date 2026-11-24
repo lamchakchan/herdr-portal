@@ -71,7 +71,7 @@ nl='
 printf 'NOW\t%s\n' "$(date +%s)"
 # The top-level leadSessionId of the JSON file $1, or nothing. Like the parser, the last one counts, and a value that
 # isn't a string gives none. Read in one pass over at most cap + 1 bytes (split, since substr per byte is quadratic
-# in macOS awk).
+# in macOS awk). The bound holds even though emit checked the size: the file can grow between wc and this read.
 lead_of() {
   head -c $((cap + 1)) "$1" 2>/dev/null | awk 'BEGIN { RS = "\001" } {
     n = split($0, ch, ""); d = 0; ins = 0; esc = 0; key = 0; want = 0; top = ""
