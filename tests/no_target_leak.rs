@@ -24,6 +24,7 @@ impl Fake {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::create_dir_all(dir.join("state")).unwrap();
+        fs::create_dir_all(dir.join("cfg")).unwrap();
         let ssh = format!(
             r#"#!/bin/sh
 for a in "$@"; do last="$a"; done
@@ -51,6 +52,24 @@ esac
         Fake { dir }
     }
 
+    /// Saved machines as the fake `herdr machine list` prints them.
+    fn machines(&self, rows: &str) {
+        write_exec(
+            &self.dir.join("bin/herdr"),
+            &format!("#!/bin/sh\necho '{rows}'\n"),
+        );
+    }
+
+    /// Like `assert_clean`, and the fake's own folder (state, config and log paths) never shows either.
+    fn assert_clean(&self, what: &str, stdout: &str, stderr: &str) {
+        assert_clean(what, stdout, stderr);
+        let dir = self.dir.display().to_string();
+        assert!(
+            !stdout.contains(&dir),
+            "{what}: stdout holds a path: {stdout}"
+        );
+    }
+
     fn forward(&self) {
         let rows = format!(
             r#"[{{"machine_id":"5b4e","label":"devbox","target":"{TARGET}","remote_port":5173,"local_port":5173}}]"#
@@ -64,6 +83,10 @@ esac
     }
 
     fn run_status(&self, args: &[&str]) -> (bool, String, String) {
+        self.run_env(args, &[])
+    }
+
+    fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String, String) {
         let path = format!(
             "{}:/usr/bin:/bin:/usr/sbin:/sbin",
             self.dir.join("bin").display()
@@ -74,6 +97,9 @@ esac
             .env("HOME", &self.dir)
             .env("HERDR_BIN_PATH", self.dir.join("bin/herdr"))
             .env("HERDR_PLUGIN_STATE_DIR", self.dir.join("state"))
+            .env("HERDR_PLUGIN_CONFIG_DIR", self.dir.join("cfg"))
+            .env("HERDR_PANE_ID", "w1:p1")
+            .envs(env.iter().copied())
             .output()
             .unwrap();
         (
@@ -157,4 +183,126 @@ fn the_plain_cli_keeps_ssh_s_own_words() {
         err.contains("Connection refused"),
         "the person at the terminal sees why: {err}"
     );
+}
+
+#[test]
+fn watch_once_rows_hide_the_target_and_ssh_s_words() {
+    for mode in ["down", "unreachable"] {
+        let fake = Fake::new(&format!("watch-{mode}"), mode);
+        let (out, err) = fake.run(&["watch", "--once", "--json"]);
+        let doc: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let devbox = doc["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["machine"] == "devbox")
+            .unwrap_or_else(|| panic!("no devbox row: {out}"))
+            .clone();
+        assert_eq!(devbox["ok"], false, "{out}");
+        assert_eq!(devbox["error"]["code"], "ssh_failed", "{out}");
+        fake.assert_clean(&format!("watch --once, {mode}"), &out, &err);
+        // The person at the terminal still sees ssh's words.
+        let (_, plain, _) = fake.run_status(&["watch", "--once"]);
+        assert!(
+            plain.contains("192.0.2.1"),
+            "plain watch keeps the detail: {plain}"
+        );
+    }
+}
+
+#[test]
+fn a_missing_herdr_binary_names_no_path() {
+    let fake = Fake::new("noherdr", "unreachable");
+    let missing = "/Users/someone/.local/bin/herdr";
+    let (_, out, err) = fake.run_env(&["scan", "local", "--json"], &[("HERDR_BIN_PATH", missing)]);
+    assert_eq!(error_code(&out), "herdr_failed");
+    fake.assert_clean("scan, no herdr", &out, &err);
+    let (_, out, err) = fake.run_env(&["requests", "--json"], &[("HERDR_BIN_PATH", missing)]);
+    assert_eq!(error_code(&out), "herdr_failed");
+    fake.assert_clean("requests, no herdr", &out, &err);
+}
+
+#[test]
+fn an_auto_config_that_does_not_parse_names_no_path_or_contents() {
+    let fake = Fake::new("badcfg", "unreachable");
+    fs::write(
+        fake.dir.join("cfg/config.toml"),
+        "[auto]\nports = /Users/someone/secret\n",
+    )
+    .unwrap();
+    for args in [
+        &["watch", "--status", "--json"][..],
+        &["watch", "--once", "--json"][..],
+    ] {
+        let (out, err) = fake.run(args);
+        let doc: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(doc["ok"], true, "{out}");
+        assert!(!out.contains("secret"), "{args:?}: {out}");
+        fake.assert_clean(&format!("{args:?}"), &out, &err);
+    }
+    let (out, _) = fake.run(&["watch", "--status", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(doc["watch"]["auto"]["error"], "config.toml does not parse.");
+    assert_eq!(doc["watch"]["auto"]["config"], "config.toml");
+    assert_eq!(doc["watch"]["log"], "watch.log");
+}
+
+#[test]
+fn restore_rejects_json() {
+    let fake = Fake::new("restore", "down");
+    fake.forward();
+    let (ok, out, err) = fake.run_status(&["restore", "--json"]);
+    assert!(!ok);
+    assert_eq!(error_code(&out), "invalid_args");
+    fake.assert_clean("restore --json", &out, &err);
+}
+
+#[test]
+fn an_unknown_or_ambiguous_selector_is_not_echoed() {
+    let fake = Fake::new("selector", "unreachable");
+    let (out, err) = fake.run(&["scan", "someone@192.0.2.9", "--json"]);
+    assert_eq!(error_code(&out), "machine_not_found");
+    assert!(!out.contains("192.0.2.9"), "{out}");
+    fake.assert_clean("unknown selector", &out, &err);
+    fake.machines(&format!(
+        r#"[{{"id":"a1","label":"twin","target":"{TARGET}","enabled":true}},{{"id":"b2","label":"twin","target":"{TARGET}","enabled":true}}]"#
+    ));
+    let (out, err) = fake.run(&["scan", "twin", "--json"]);
+    assert_eq!(error_code(&out), "invalid_args");
+    assert!(!out.contains("twin"), "{out}");
+    fake.assert_clean("ambiguous selector", &out, &err);
+}
+
+#[test]
+fn add_start_and_stop_failures_hide_the_target() {
+    for mode in ["down", "unreachable"] {
+        let fake = Fake::new(&format!("forward-{mode}"), mode);
+        let (out, err) = fake.run(&["add", "devbox", "5173", "--local-port", "45173", "--json"]);
+        assert_eq!(error_code(&out), "ssh_failed", "add, {mode}");
+        fake.assert_clean(&format!("add, {mode}"), &out, &err);
+        fake.forward();
+        let (out, err) = fake.run(&["start", "5173", "--json"]);
+        assert_eq!(error_code(&out), "ssh_failed", "start, {mode}: {out}");
+        fake.assert_clean(&format!("start, {mode}"), &out, &err);
+        let (out, err) = fake.run(&["stop", "5173", "--json"]);
+        fake.assert_clean(&format!("stop, {mode}"), &out, &err);
+    }
+}
+
+#[test]
+fn request_commands_hide_herdr_s_words() {
+    let fake = Fake::new("requests", "unreachable");
+    write_exec(
+        &fake.dir.join("bin/herdr"),
+        &format!("#!/bin/sh\necho 'herdr: /Users/someone/.config {TARGET} refused' >&2\nexit 3\n"),
+    );
+    for args in [
+        &["request", "5173", "--json"][..],
+        &["release", "5173", "--json"][..],
+        &["requests", "--json"][..],
+    ] {
+        let (out, err) = fake.run(args);
+        assert_eq!(error_code(&out), "herdr_failed", "{args:?}: {out}");
+        fake.assert_clean(&format!("{args:?}"), &out, &err);
+    }
 }

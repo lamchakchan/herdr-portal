@@ -241,6 +241,24 @@ CLI prints ssh's own words, so a person at the terminal can see why a connection
 | `herdr_failed` | `herdr` on the target machine failed or wasn't found. |
 | `internal` | Anything else. |
 
+`watch --status --json` and `start-watch --json` give `log` and `auto.config` as file names (`watch.log`,
+`config.toml`), relative to the plugin's state and config folders, so the JSON names no home path. Without `--json`,
+`start-watch` prints the full log path.
+
+### Changes since 0.5.0: errors in `--json`
+
+| Before | Now |
+| --- | --- |
+| An SSH failure's `message` quoted ssh's stderr and the target. | Fixed text; the plain CLI keeps ssh's words. |
+| `watch --once --json` rows (`error`, `auto_error`) quoted the target and ssh's stderr. | Fixed text; `watch.log` and plain `watch` keep the detail. |
+| Exit 255 from a remote `herdr` call gave `herdr_failed`; from a remote port scan, `internal`. | Both give `ssh_failed`: 255 is ssh's own exit code. |
+| A missing local `herdr` gave `internal` with its path. | `herdr_failed`, "Could not run herdr." A missing `ssh` gives `ssh_failed`. |
+| `machine_not_found` quoted the selector. | Fixed text, no selector. |
+| An ambiguous selector gave `internal` and quoted it. | `invalid_args`, fixed text. |
+| A `config.toml` that doesn't parse put its path and a snippet in `auto.error`. | "config.toml does not parse." (`invalid_args`). |
+| `watch --status` and `start-watch` gave absolute `log` and `config` paths. | File names, as above. |
+| `restore --json` ignored `--json`. | `invalid_args`: `restore` has no JSON output. |
+
 ## Agent requests
 
 An agent on the remote machine can ask the laptop for a forward without any

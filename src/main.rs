@@ -128,6 +128,10 @@ fn run(mut args: Vec<String>, json_out: bool) -> Result<()> {
         "requests" => requests::cmd_requests(&args[1..], json_out),
         "watch" => requests::cmd_watch(&args[1..], json_out),
         "start-watch" => requests::cmd_start_watch(&args[1..], json_out),
+        "restore" if json_out => Err(api::err(
+            "invalid_args",
+            "restore has no --json output; use list --json --state inactive and start --json.",
+        )),
         "restore" => cmd_restore(),
         "open-picker" => cmd_open_picker(&args[1..]),
         "from-url" => cmd_from_url(),
@@ -269,7 +273,7 @@ fn run_cmd(args: &[&str], input: Option<&str>) -> Result<(i32, String, String)> 
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().with_context(|| args[0].to_string())?;
+    let mut child = cmd.spawn().map_err(|e| spawn_failure(args[0], &e))?;
     if let Some(text) = input {
         if let Some(stdin) = child.stdin.as_mut() {
             stdin.write_all(text.as_bytes())?;
@@ -280,6 +284,20 @@ fn run_cmd(args: &[&str], input: Option<&str>) -> Result<(i32, String, String)> 
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let code = output.status.code().unwrap_or(1);
     Ok((code, stdout, stderr))
+}
+
+/// A command that would not start. `--json` names the tool, never the path it was looked up at (`HERDR_BIN_PATH` can
+/// sit in a home folder); the plain CLI shows both.
+fn spawn_failure(program: &str, error: &std::io::Error) -> anyhow::Error {
+    let detail = format!("{program}: {error}");
+    if program == herdr_bin() {
+        return api::err_with("herdr_failed", "Could not run herdr.", detail);
+    }
+    match Path::new(program).file_name().and_then(|n| n.to_str()) {
+        Some("ssh") => api::err_with("ssh_failed", "Could not run ssh.", detail),
+        Some(name) => api::err_with("internal", &format!("Could not run {name}."), detail),
+        None => api::err_with("internal", "Could not run a command.", detail),
+    }
 }
 
 fn load_machines() -> Result<Vec<Machine>> {
@@ -322,11 +340,16 @@ fn resolve_machine(selector: &str) -> Result<Machine> {
         .collect();
     match matches.len() {
         1 => Ok(matches.into_iter().next().unwrap()),
-        0 => Err(api::err(
+        0 => Err(api::err_with(
             "machine_not_found",
+            "Unknown machine. Use Local or `herdr machine list`.",
             format!("Unknown machine '{selector}'. Use Local or `herdr machine list`."),
         )),
-        _ => bail!("Machine '{selector}' is ambiguous; use the profile id."),
+        _ => Err(api::err_with(
+            "invalid_args",
+            "More than one machine matches; use the profile id.",
+            format!("Machine '{selector}' is ambiguous; use the profile id."),
+        )),
     }
 }
 

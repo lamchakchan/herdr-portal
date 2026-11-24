@@ -241,10 +241,7 @@ fn clear_token(machine: &Machine, pane: &str, source: &str, key: &str) -> Result
 }
 
 pub(crate) fn error_code(error: &anyhow::Error) -> String {
-    api::error_json(error)["error"]["code"]
-        .as_str()
-        .unwrap_or("internal")
-        .to_string()
+    api::error_code(error).to_string()
 }
 
 fn static_code(code: &str) -> &'static str {
@@ -604,21 +601,47 @@ fn tick_machine(machine: &Machine) -> Result<(Vec<Value>, HashSet<u16>)> {
 /// when `with_auto`, closing auto forwards the `[auto]` rules no longer allow.
 /// What one pass did. `auto` is None when the pass skipped auto-forward, and
 /// otherwise holds the config error, if the config didn't load.
+/// `machines` is what `--json` prints; `details` holds, per row, the full error text for watch.log and the plain CLI,
+/// which can name the SSH target and so never goes in the JSON.
 struct Pass {
     machines: Vec<Value>,
-    auto: Option<Option<String>>,
+    details: Vec<RowDetail>,
+    auto: Option<Option<Said>>,
+}
+
+#[derive(Default)]
+struct RowDetail {
+    error: Option<String>,
+    auto_error: Option<String>,
+}
+
+/// An error as `--json` shows it, and as a person reads it.
+struct Said {
+    json: String,
+    detail: String,
+}
+
+impl Said {
+    fn of(error: &anyhow::Error) -> Said {
+        Said {
+            json: api::json_message(error),
+            detail: format!("{error:#}"),
+        }
+    }
 }
 
 fn tick(with_auto: bool) -> Result<Pass> {
     let config = with_auto.then(auto::load_config);
     let config_error = match &config {
-        Some(Err(error)) => Some(Some(format!("{error:#}"))),
+        Some(Err(error)) => Some(Some(Said::of(error))),
         Some(Ok(_)) => Some(None),
         None => None,
     };
     let mut machines = Vec::new();
+    let mut details = Vec::new();
     for machine in load_machines()? {
         let mut row = json!({"machine": machine.label, "machine_id": machine.id});
+        let mut detail = RowDetail::default();
         match tick_machine(&machine) {
             Ok((mut actions, wanted)) => {
                 row["ok"] = json!(true);
@@ -633,8 +656,9 @@ fn tick(with_auto: bool) -> Result<Pass> {
                         Err(error) => {
                             row["auto_error"] = json!({
                                 "code": error_code(&error),
-                                "message": format!("{error:#}"),
+                                "message": api::json_message(&error),
                             });
+                            detail.auto_error = Some(format!("{error:#}"));
                         }
                     }
                 }
@@ -642,13 +666,17 @@ fn tick(with_auto: bool) -> Result<Pass> {
             }
             Err(error) => {
                 row["ok"] = json!(false);
-                row["error"] = json!({"code": error_code(&error), "message": format!("{error:#}")});
+                row["error"] =
+                    json!({"code": error_code(&error), "message": api::json_message(&error)});
+                detail.error = Some(format!("{error:#}"));
             }
         }
         machines.push(row);
+        details.push(detail);
     }
     Ok(Pass {
         machines,
+        details,
         auto: config_error,
     })
 }
@@ -675,17 +703,14 @@ fn action_line(label: &str, a: &Value) -> String {
     line
 }
 
-fn print_actions(machines: &[Value]) {
-    for m in machines {
+fn print_actions(pass: &Pass) {
+    for (m, detail) in pass.machines.iter().zip(&pass.details) {
         let label = m["machine"].as_str().unwrap_or("?");
         if m["ok"] == json!(false) {
-            println!(
-                "{label}: {}",
-                m["error"]["message"].as_str().unwrap_or("error")
-            );
+            println!("{label}: {}", detail.error.as_deref().unwrap_or("error"));
             continue;
         }
-        if let Some(message) = m["auto_error"]["message"].as_str() {
+        if let Some(message) = &detail.auto_error {
             println!("{label}: auto: {message}");
         }
         for a in m["actions"].as_array().into_iter().flatten() {
@@ -714,8 +739,10 @@ fn lock_path() -> Result<PathBuf> {
     Ok(state_dir()?.join("watch.lock"))
 }
 
+const LOG_FILE: &str = "watch.log";
+
 fn log_path() -> Result<PathBuf> {
-    Ok(state_dir()?.join("watch.log"))
+    Ok(state_dir()?.join(LOG_FILE))
 }
 
 /// Holds the single-instance lock for as long as the file stays open. The
@@ -801,20 +828,17 @@ fn run_loop(interval: Duration, restore_first: bool) -> Result<()> {
         }
         match tick(with_auto) {
             Ok(pass) => {
-                for m in &pass.machines {
+                for (m, detail) in pass.machines.iter().zip(&pass.details) {
                     let label = m["machine"].as_str().unwrap_or("?");
                     for a in m["actions"].as_array().into_iter().flatten() {
                         if a["changed"] == json!(true) {
                             println!("{} {}", stamp(), action_line(label, a));
                         }
                     }
-                    let message = m["error"]["message"].as_str().unwrap_or("").to_string();
+                    let message = detail.error.clone().unwrap_or_default();
                     log_change(&mut last_errors, label.to_string(), message, label);
                     if with_auto && m["ok"] == json!(true) {
-                        let message = m["auto_error"]["message"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
+                        let message = detail.auto_error.clone().unwrap_or_default();
                         log_change(
                             &mut last_errors,
                             format!("{label} auto"),
@@ -827,7 +851,7 @@ fn run_loop(interval: Duration, restore_first: bool) -> Result<()> {
                     log_change(
                         &mut last_errors,
                         "auto config".into(),
-                        config_error.unwrap_or_default(),
+                        config_error.map(|said| said.detail).unwrap_or_default(),
                         "auto config",
                     );
                 }
@@ -864,21 +888,19 @@ fn spawn_detached() -> Result<u32> {
     Ok(child.id())
 }
 
+/// The watch's state. `config` and `log` are file names, relative to the plugin's config and state folders, so the
+/// JSON names no home path; the plain CLI prints the full log path from `log_path`.
 fn watch_status() -> Result<Value> {
     let running = try_lock()?.is_none();
-    let auto = match auto::load_config() {
-        Ok(config) => {
-            json!({"enabled": config.enabled, "config": auto::config_path()?.display().to_string(), "error": null})
-        }
-        Err(error) => {
-            json!({"enabled": false, "config": auto::config_path()?.display().to_string(), "error": format!("{error:#}")})
-        }
+    let (enabled, error) = match auto::load_config() {
+        Ok(config) => (config.enabled, None),
+        Err(error) => (false, Some(api::json_message(&error))),
     };
     Ok(json!({
         "running": running,
         "pid": if running { lock_owner() } else { None },
-        "log": log_path()?.display().to_string(),
-        "auto": auto,
+        "log": LOG_FILE,
+        "auto": {"enabled": enabled, "config": auto::CONFIG_FILE, "error": error},
     }))
 }
 
@@ -903,10 +925,7 @@ pub(crate) fn cmd_start_watch(args: &[String], json_out: bool) -> Result<()> {
         }}));
     }
     match (started, pid) {
-        (true, Some(pid)) => println!(
-            "Started watch (pid {pid}); log: {}",
-            status["log"].as_str().unwrap_or("")
-        ),
+        (true, Some(pid)) => println!("Started watch (pid {pid}); log: {}", log_path()?.display()),
         (_, pid) => println!(
             "watch is already running (pid {})",
             pid.map_or("?".into(), |p| p.to_string())
@@ -941,18 +960,18 @@ pub(crate) fn cmd_watch(args: &[String], json_out: bool) -> Result<()> {
     }
     if args.switches.contains("--once") {
         let pass = tick(true)?;
-        let config_error = pass.auto.flatten();
+        let config_error = pass.auto.as_ref().and_then(Option::as_ref);
         if json_out {
             return print_json(&json!({
                 "ok": true,
                 "machines": pass.machines,
-                "auto": {"error": config_error},
+                "auto": {"error": config_error.map(|said| &said.json)},
             }));
         }
-        if let Some(message) = config_error {
-            println!("auto config: {message}");
+        if let Some(said) = config_error {
+            println!("auto config: {}", said.detail);
         }
-        print_actions(&pass.machines);
+        print_actions(&pass);
         return Ok(());
     }
     let interval = match args.flags.get("--interval") {

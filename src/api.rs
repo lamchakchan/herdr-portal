@@ -43,16 +43,26 @@ pub(crate) fn err_with(
 }
 
 pub(crate) fn error_json(error: &anyhow::Error) -> Value {
-    let api = error
+    json!({"ok": false, "error": {"code": error_code(error), "message": json_message(error)}})
+}
+
+fn api_error(error: &anyhow::Error) -> Option<&ApiError> {
+    error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<ApiError>());
-    let code = api.map_or("internal", |api| api.code);
-    // An ApiError's own message, never its detail (or the chain's Display, which shows the detail).
-    let message = match api {
+        .find_map(|cause| cause.downcast_ref::<ApiError>())
+}
+
+pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
+    api_error(error).map_or("internal", |api| api.code)
+}
+
+/// What `--json` prints as an error's message: an ApiError's own message, never its detail (or the chain's Display,
+/// which shows the detail). The plain CLI and watch.log print `{error:#}` instead.
+pub(crate) fn json_message(error: &anyhow::Error) -> String {
+    match api_error(error) {
         Some(api) if api.detail.is_some() => api.message.clone(),
         _ => format!("{error:#}"),
-    };
-    json!({"ok": false, "error": {"code": code, "message": message}})
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
