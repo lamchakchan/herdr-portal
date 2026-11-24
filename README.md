@@ -356,15 +356,17 @@ herdr-portal event end    --work AT-3400 --outcome done
 | `head` | 7 to 40 lower-case hex digits |
 | `repo` | `owner/name` |
 | `number` | 1 to 1,000,000,000 |
-| `action` | `opened`, `merged`, `closed` |
+| `action` | `opened`, `merged`, `closed`; for a merge queue, `queued` (submitted), `requeued` (back to waiting after a failure or a push) and `dequeued` (taken out without merging) |
 | `outcome` | `done`, `dropped` |
 
 - A field the kind doesn't take, a missing one, a flag given twice, an unknown flag (`--at` among them) or any value
   outside its pattern fails with `invalid_args`, and nothing is written. The message names the field, never the value;
-  for an unknown `--flag=value` it names only `--flag`. Numbers are plain digits with no sign or leading zero.
-- The file is opened without following a symlink and without blocking, must be a regular file this user owns, and is
-  made 0600 through the open file. A symlinked or non-directory `history` is refused before any chmod. These fail with
-  `internal`, as does a clock outside 2020 to 2100 (the portal sets the time, so that is the machine's fault).
+  for an unknown `--flag=value` it names only `--flag`, and an unknown argument that isn't a plain `--name` is not
+  named at all. Numbers are plain digits with no sign or leading zero.
+- The file is opened without following a symlink and without blocking. It must be a regular file this user owns with
+  no other hard link, and is made 0600 through the open file. The `history` directory is opened without following a
+  symlink and chmodded through that open directory, so a symlinked or non-directory `history` is refused. These fail
+  with `internal`, as does a clock outside 2020 to 2100 (the portal sets the time, so that is the machine's fault).
 - Each line, at most 1 KiB, goes in one `write(2)` on an append-only file, so writers running at once never
   interleave. A write cut short fails with `internal` and is left as it is; the reader drops a partial line.
 - Exit 0 and no output on success. With `--json`, `{"ok": true, "event": {…}}`.
