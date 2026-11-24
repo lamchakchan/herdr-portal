@@ -343,7 +343,7 @@ herdr-portal event end    --work AT-3400 --outcome done
 
 | Field | Values |
 | --- | --- |
-| `work` | A Jira key (`AT-3400`), `repo:branch` (`herdr-portal:feat/x`; `/` only between branch segments, none `.`, `..` or starting with `-`; at most 128 bytes), or a tracker id (`q-sticky-agents`, `1152`; at most 64) |
+| `work` | A Jira key (`AT-3400`; a project key of at most 10), `repo:branch` (`herdr-portal:feat/x`; `/` only between branch segments, none `.`, `..` or starting with `-`; at most 128 bytes), or a tracker id (`q-sticky-agents`, `1152`; at most 64) |
 | `name`, `terminal` | `[A-Za-z0-9][A-Za-z0-9._-]*`, at most 64 |
 | `model` | `[a-z0-9][a-z0-9.-]*`, at most 64 (`claude-opus-5-5`) |
 | `pane` | `<id>:<id>` (`w1:p2`) |
@@ -359,11 +359,19 @@ herdr-portal event end    --work AT-3400 --outcome done
 | `action` | `opened`, `merged`, `closed` |
 | `outcome` | `done`, `dropped` |
 
-- A field the kind doesn't take, a missing one, an unknown flag (`--at` among them) or any value outside its pattern
-  fails with `invalid_args`. The message names the field, never the value, and nothing is written.
+- A field the kind doesn't take, a missing one, a flag given twice, an unknown flag (`--at` among them) or any value
+  outside its pattern fails with `invalid_args`, and nothing is written. The message names the field, never the value;
+  for an unknown `--flag=value` it names only `--flag`. Numbers are plain digits with no sign or leading zero.
+- The file is opened without following a symlink and without blocking, must be a regular file this user owns, and is
+  made 0600 through the open file. A symlinked or non-directory `history` is refused before any chmod. These fail with
+  `internal`, as does a clock outside 2020 to 2100 (the portal sets the time, so that is the machine's fault).
 - Each line, at most 1 KiB, goes in one `write(2)` on an append-only file, so writers running at once never
   interleave. A write cut short fails with `internal` and is left as it is; the reader drops a partial line.
 - Exit 0 and no output on success. With `--json`, `{"ok": true, "event": {…}}`.
+- **Slugs can carry words.** A name (64), a branch (128) or a repo name (100) may spell out words, as branch names
+  often do. The log never holds prose fields, but those ids are whatever the caller named things.
+- **Schema changes.** A new field or kind needs `schema` 2. Readers of schema 1 drop those lines and report
+  `complete: false`, so old Headways show less, never something wrong.
 - **Callers skip** when the binary is missing (exit 127) or answers `invalid_args` for `event`, as a portal older than
   the command does. A missing history must never stop the work.
 

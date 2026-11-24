@@ -149,7 +149,9 @@ pub(crate) fn parse_args(
             out.switches.insert(name);
             i += 1;
         } else if arg.starts_with("--") {
-            return Err(err("invalid_args", format!("unknown argument {arg}")));
+            // Only the flag's name: `--flag=value` may carry anything after the `=` (1176).
+            let flag = arg.split('=').next().unwrap_or(arg);
+            return Err(err("invalid_args", format!("unknown argument {flag}")));
         } else {
             out.positional.push(arg.to_string());
             i += 1;
