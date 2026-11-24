@@ -60,12 +60,6 @@ impl Fixture {
         )
         .unwrap();
         fs::write(subagents.join("agent-ax\nNOW\t2\n.jsonl"), "").unwrap();
-        // A name that, printed whole by stat, would forge another teammate's write time.
-        fs::write(
-            subagents.join("agent-ax\n9999999999.5\tagent-avictim-0123456789abcdef.jsonl"),
-            "",
-        )
-        .unwrap();
         // A lead id that is not one: it must never become a path.
         fs::create_dir_all(home.join(".claude/teams/evil")).unwrap();
         fs::write(
@@ -498,7 +492,7 @@ fn with_ssh(fixture: &Fixture, body: &str) {
 }
 
 #[test]
-fn a_machine_that_floods_or_hangs_is_cut_off_with_everything_it_started() {
+fn a_machine_that_floods_is_cut_off() {
     let fixture = Fixture::new("flood");
     with_ssh(&fixture, "cat >/dev/null; exec yes");
     let start = std::time::Instant::now();
@@ -506,17 +500,11 @@ fn a_machine_that_floods_or_hangs_is_cut_off_with_everything_it_started() {
     assert!(!ok);
     assert!(stdout.contains("printed too much"), "{stdout}");
     assert!(start.elapsed() < std::time::Duration::from_secs(10));
+}
 
-    let fixture = Fixture::new("hang");
-    let pidfile = fixture.dir.join("sleep.pid");
-    with_ssh(
-        &fixture,
-        &format!(
-            "cat >/dev/null; sleep 60 & echo $! > '{}'; wait",
-            pidfile.display()
-        ),
-    );
-    let start = std::time::Instant::now();
+/// Runs `progress devbox --json` with the debug build's 1 s deadline.
+#[cfg(debug_assertions)]
+fn run_with_short_deadline(fixture: &Fixture) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_herdr-portal"))
         .args(["progress", "devbox", "--json"])
         .env(
@@ -533,20 +521,71 @@ fn a_machine_that_floods_or_hangs_is_cut_off_with_everything_it_started() {
         .env("HERDR_PORTAL_PROGRESS_DEADLINE_MS", "1000")
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!out.status.success());
-    assert!(stdout.contains("took too long"), "{stdout}");
-    assert!(start.elapsed() < std::time::Duration::from_secs(10));
-    let pid: i32 = fs::read_to_string(&pidfile)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[cfg(debug_assertions)]
+fn gone(pidfile: &std::path::Path) -> bool {
+    let pid: i32 = fs::read_to_string(pidfile).unwrap().trim().parse().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(200));
-    let alive = Command::new("kill")
+    !Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
         .unwrap()
-        .success();
-    assert!(!alive, "the fake ssh's sleep still runs");
+        .success()
+}
+
+/// Debug builds only: the deadline knob is ignored in release, where the read has its full 20 s.
+#[cfg(debug_assertions)]
+#[test]
+fn a_machine_that_hangs_or_leaves_its_output_open_is_cut_off_with_everything_it_started() {
+    for (name, body) in [
+        ("hang", "cat >/dev/null; sleep 60 & echo $! > '{pid}'; wait"),
+        // ssh exits at once, but what it left behind still holds stdout.
+        (
+            "linger",
+            "cat >/dev/null; sleep 60 & echo $! > '{pid}'; exit 0",
+        ),
+    ] {
+        let fixture = Fixture::new(name);
+        let pidfile = fixture.dir.join("sleep.pid");
+        with_ssh(
+            &fixture,
+            &body.replace("{pid}", &pidfile.display().to_string()),
+        );
+        let start = std::time::Instant::now();
+        let (ok, stdout) = run_with_short_deadline(&fixture);
+        assert!(!ok, "{name}");
+        assert!(stdout.contains("took too long"), "{name}: {stdout}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "{name}"
+        );
+        assert!(gone(&pidfile), "{name}: the fake ssh's sleep still runs");
+    }
+}
+
+#[test]
+fn a_transcript_name_that_could_forge_a_time_is_skipped_and_leaves_the_list_incomplete() {
+    let fixture = Fixture::new("forge");
+    // Printed whole by stat, this name would give agent-avictim a write time of 9999999999.5.
+    fs::write(
+        subagents(&fixture, LEAD)
+            .join("agent-ax\n9999999999.5\tagent-avictim-0123456789abcdef.jsonl"),
+        "",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = fixture.run(&["progress", "devbox", "--json"]);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("victim"), "{stdout}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let squad = team_of(&doc, "squad");
+    assert_eq!(squad["transcripts_complete"], false, "{squad}");
+    assert_eq!(
+        squad["transcripts"][0]["name"],
+        "agent-aimpl-x-0123456789abcdef.jsonl"
+    );
 }

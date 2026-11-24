@@ -294,7 +294,7 @@ remote agent's progress and teammates.
   a consumer must clamp them (a percent to 0–100, a time to a sane range).
 - `transcripts` lists the lead's teammate transcripts newest first, at most 1000 per lead. `transcripts_complete` is
   false when that list was cut, or the lead's folder wasn't read, or `stat` failed for any transcript: a teammate
-  missing from it has an unknown state, not "no transcript yet". A transcript whose name isn't plain is never listed.
+  missing from it has an unknown state, not "no transcript yet". A transcript whose name isn't plain, or whose path holds a newline or tab, is never listed, and it makes the list incomplete.
   The lead is the config's top-level `leadSessionId` only.
 - Nothing is logged or written.
 - An entry's `error` is `bad_json`, or `too_large` past 256 KiB.

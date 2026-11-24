@@ -69,12 +69,14 @@ tab=$(printf '\t')
 nl='
 '
 printf 'NOW\t%s\n' "$(date +%s)"
-# The top-level leadSessionId of the JSON file $1 (the last one, as the parser keeps), or nothing.
+# The top-level leadSessionId of the JSON file $1, or nothing. Like the parser, the last one counts, and a value that
+# isn't a string gives none. Read in one pass over at most cap + 1 bytes (split, since substr per byte is quadratic
+# in macOS awk).
 lead_of() {
-  awk 'BEGIN { RS = "\001" } {
-    n = length($0); d = 0; ins = 0; esc = 0; key = 0; want = 0; top = ""
+  head -c $((cap + 1)) "$1" 2>/dev/null | awk 'BEGIN { RS = "\001" } {
+    n = split($0, ch, ""); d = 0; ins = 0; esc = 0; key = 0; want = 0; top = ""
     for (i = 1; i <= n; i++) {
-      c = substr($0, i, 1)
+      c = ch[i]
       if (ins) {
         if (esc) esc = 0
         else if (c == "\\") esc = 1
@@ -87,11 +89,12 @@ lead_of() {
       if (c == " " || c == "\t" || c == "\n" || c == "\r") continue
       if (c == "\"") { ins = 1; b = i + 1; continue }
       if (c == ":" && key) { want = 1; key = 0; continue }
+      if (want) id = ""
       key = 0; want = 0
       if (c == "{" || c == "[") { if (d == 0 && top == "") top = c; d++ }
       else if (c == "}" || c == "]") d--
     }
-  } END { if (id != "") print id }' "$1" 2>/dev/null
+  } END { if (id != "") print id }' 2>/dev/null
 }
 plain() { [ "${#1}" -le 160 ] || return 1; case "$1" in ''|*[!A-Za-z0-9._:-]*) return 1 ;; esac; }
 emit() {
@@ -130,11 +133,11 @@ for id in $(for i in $ids; do printf '%s\n' "$i"; done | grep -E '^[0-9a-f-]{36}
   set -- "$HOME"/.claude/projects/*/"$id"/subagents/agent-a*-????????????????.jsonl
   [ -e "$1" ] || { printf 'DONE\t%s\n' "$id"; continue; }
   files=()
-  for f in "$@"; do
-    case "$f" in *"$nl"*|*"$tab"*) continue ;; esac
-    plain "${f##*/}" && files+=("$f")
-  done
   k=0; cut=; stats=
+  for f in "$@"; do
+    case "$f" in *"$nl"*|*"$tab"*) cut=1; continue ;; esac
+    if plain "${f##*/}"; then files+=("$f"); else cut=1; fi
+  done
   if [ "${#files[@]}" -gt 0 ]; then
     if [ "${#fmt[@]}" -eq 0 ]; then cut=1
     else stats=$(printf '%s\0' "${files[@]}" | xargs -0 -n 500 stat "${fmt[@]}" -- 2>/dev/null) || cut=1; fi
@@ -453,9 +456,11 @@ fn deadline() -> Duration {
 }
 
 /// Runs `args` in a process group of its own, `input` on its stdin. Past `deadline`, or once stdout passes `limit`
-/// bytes, the whole group is killed (ssh and anything the script started) and the read fails with fixed text. After
-/// the child exits, the group is killed only if something it left behind still holds stdout open at the deadline:
-/// then the group still has a member, so its id can't have been reused. stderr is kept up to 64 KiB.
+/// bytes, the whole group is killed (ssh and anything the script started) and the read fails with fixed text. A child
+/// that exits cleanly is not killed after. If something it left behind still holds stdout or stderr open at the
+/// deadline, the group is killed then: usually that leftover is a member, which keeps the group id from being reused.
+/// A leftover that left the group (setsid) is not reached, and the read still ends at the deadline. stderr is kept up
+/// to 64 KiB.
 fn run_bounded(
     args: &[&str],
     input: &str,
@@ -898,6 +903,64 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
+    }
+
+    #[test]
+    fn only_a_config_s_last_top_level_string_lead_id_is_read() {
+        const A: &str = "aaaaaaaa-0000-4000-8000-00000000000a";
+        const B: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
+        let cases: [(&str, String, Option<&str>); 8] = [
+            (
+                "depth",
+                format!(r#"{{"leadSessionId":"{A}","x":{{"leadSessionId":"{B}"}}}}"#),
+                Some(A),
+            ),
+            (
+                "quoted",
+                format!(r#"{{"x":"\"leadSessionId\":\"{B}\"","leadSessionId":"{A}"}}"#),
+                Some(A),
+            ),
+            (
+                "backslash",
+                format!(r#"{{"a":"\\\\","leadSessionId":"{A}"}}"#),
+                Some(A),
+            ),
+            (
+                "last",
+                format!(r#"{{"leadSessionId":"{A}","leadSessionId":"{B}"}}"#),
+                Some(B),
+            ),
+            ("array", format!(r#"[{{"leadSessionId":"{A}"}}]"#), None),
+            // Not JSON, so the parser finds no lead: neither does the script.
+            ("bare-array", format!(r#"["leadSessionId":"{A}"]"#), None),
+            // An escaped quote doesn't end the string: read as if it did, the rest of the file loses its keys.
+            (
+                "escaped-quote",
+                format!(r#"{{"x":"\"","leadSessionId":"{A}"}}"#),
+                Some(A),
+            ),
+            (
+                "number",
+                format!(r#"{{"leadSessionId":"{A}","leadSessionId":5}}"#),
+                None,
+            ),
+        ];
+        for (name, config, want) in cases {
+            let out = raw_stream(&format!("lead-{name}"), |home| {
+                let team = home.join(".claude/teams/t");
+                fs::create_dir_all(&team).unwrap();
+                fs::write(team.join("config.json"), &config).unwrap();
+            });
+            let got: Vec<&str> = [A, B]
+                .into_iter()
+                .filter(|id| out.contains(&format!("DONE\t{id}")))
+                .collect();
+            assert_eq!(
+                got,
+                want.into_iter().collect::<Vec<_>>(),
+                "{name}: {config}"
+            );
+        }
     }
 
     #[test]
