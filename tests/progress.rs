@@ -589,3 +589,23 @@ fn a_transcript_name_that_could_forge_a_time_is_skipped_and_leaves_the_list_inco
         "agent-aimpl-x-0123456789abcdef.jsonl"
     );
 }
+
+#[test]
+fn a_transcript_whose_name_is_not_plain_is_skipped_and_leaves_the_list_incomplete() {
+    let fixture = Fixture::new("space");
+    fs::write(
+        subagents(&fixture, LEAD).join("agent-a my-0123456789abcdef.jsonl"),
+        "",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = fixture.run(&["progress", "devbox", "--json"]);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("agent-a my"), "{stdout}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let squad = team_of(&doc, "squad");
+    assert_eq!(squad["transcripts_complete"], false, "{squad}");
+    assert_eq!(
+        squad["transcripts"][0]["name"],
+        "agent-aimpl-x-0123456789abcdef.jsonl"
+    );
+}
