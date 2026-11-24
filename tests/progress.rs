@@ -60,6 +60,12 @@ impl Fixture {
         )
         .unwrap();
         fs::write(subagents.join("agent-ax\nNOW\t2\n.jsonl"), "").unwrap();
+        // A name that, printed whole by stat, would forge another teammate's write time.
+        fs::write(
+            subagents.join("agent-ax\n9999999999.5\tagent-avictim-0123456789abcdef.jsonl"),
+            "",
+        )
+        .unwrap();
         // A lead id that is not one: it must never become a path.
         fs::create_dir_all(home.join(".claude/teams/evil")).unwrap();
         fs::write(
@@ -433,4 +439,114 @@ fn a_nested_lead_id_neither_hides_the_real_lead_nor_costs_another_team() {
             .len(),
         1
     );
+}
+
+const LEAD4: &str = "5a5b5c5d-0000-4000-8000-000000000005";
+
+#[test]
+fn a_stat_that_fails_leaves_the_list_incomplete() {
+    // `stat` answers for "/" (so the script picks it) and fails for every transcript; then it fails for everything.
+    for fake in [
+        "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\n[ \"$last\" = / ] && exec /usr/bin/stat \"$@\"\nexit 1\n",
+        "#!/bin/sh\nexit 1\n",
+    ] {
+        let fixture = Fixture::new("badstat");
+        write_exec(&fixture.dir.join("bin/stat"), fake);
+        let (ok, stdout, stderr) = fixture.run(&["progress", "devbox", "--json"]);
+        assert!(ok, "{stdout}{stderr}");
+        let doc: Value = serde_json::from_str(&stdout).unwrap();
+        let squad = team_of(&doc, "squad");
+        assert_eq!(squad["transcripts_complete"], false, "{squad}");
+    }
+}
+
+#[test]
+fn only_the_top_level_lead_id_is_read() {
+    let fixture = Fixture::new("toplevel");
+    let teams = fixture.dir.join("home/.claude/teams");
+    fs::create_dir_all(teams.join("deep")).unwrap();
+    let nested: Vec<String> = (0..5)
+        .map(|i| format!(r#"{{"name":"n{i}","x":{{"leadSessionId":"{NEST}"}}}}"#))
+        .collect();
+    fs::write(
+        teams.join("deep/config.json"),
+        format!(
+            r#"{{"members":[{}],"leadSessionId":"{LEAD4}"}}"#,
+            nested.join(",")
+        ),
+    )
+    .unwrap();
+    fs::write(
+        subagents(&fixture, LEAD4).join("agent-an0-0123456789abcdef.jsonl"),
+        "",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = fixture.run(&["progress", "devbox", "--json"]);
+    assert!(ok, "{stdout}{stderr}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let deep = team_of(&doc, "deep");
+    assert_eq!(deep["transcripts_complete"], true, "{deep}");
+    assert_eq!(deep["transcripts"].as_array().unwrap().len(), 1, "{deep}");
+}
+
+/// A fake ssh that runs `body` in place of the script (after the master checks pass).
+fn with_ssh(fixture: &Fixture, body: &str) {
+    write_exec(
+        &fixture.dir.join("bin/ssh"),
+        &format!("#!/bin/sh\ncase \" $* \" in *\" -O check \"*) echo 'Master running (pid=1)' >&2; exit 0 ;; *\" -N \"*) exit 0 ;; esac\n{body}\n"),
+    );
+}
+
+#[test]
+fn a_machine_that_floods_or_hangs_is_cut_off_with_everything_it_started() {
+    let fixture = Fixture::new("flood");
+    with_ssh(&fixture, "cat >/dev/null; exec yes");
+    let start = std::time::Instant::now();
+    let (ok, stdout, _) = fixture.run(&["progress", "devbox", "--json"]);
+    assert!(!ok);
+    assert!(stdout.contains("printed too much"), "{stdout}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+
+    let fixture = Fixture::new("hang");
+    let pidfile = fixture.dir.join("sleep.pid");
+    with_ssh(
+        &fixture,
+        &format!(
+            "cat >/dev/null; sleep 60 & echo $! > '{}'; wait",
+            pidfile.display()
+        ),
+    );
+    let start = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-portal"))
+        .args(["progress", "devbox", "--json"])
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                fixture.dir.join("bin").display()
+            ),
+        )
+        .env("HOME", fixture.dir.join("home"))
+        .env("HERDR_BIN_PATH", fixture.dir.join("bin/herdr"))
+        .env("HERDR_PLUGIN_STATE_DIR", fixture.dir.join("state"))
+        .env("TMPDIR", fixture.dir.join("tmp"))
+        .env("HERDR_PORTAL_PROGRESS_DEADLINE_MS", "1000")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(stdout.contains("took too long"), "{stdout}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "the fake ssh's sleep still runs");
 }

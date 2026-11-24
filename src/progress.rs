@@ -57,8 +57,8 @@ pub(crate) const PROGRESS_TOO_BIG: &str = "The progress read on the machine prin
 /// listed; and `CAP\t<what>` when a cap stopped a section. Records and team configs each have a 1 MiB budget, so a
 /// full records folder still leaves the teams. Transcripts: at most 1000 per lead and 5000 in all; a lead cut short
 /// gets no `DONE`. A name longer than 160 bytes or with any character outside `[A-Za-z0-9._:-]` (a newline would
-/// break the framing) is skipped. Lead ids come only from teams sent whole (at most 4 per config, so a nested id
-/// cannot hide the real one), and reach a path only after they match `^[0-9a-f-]{36}$`. A missing folder prints
+/// break the framing) is skipped. Lead ids come only from teams sent whole (only the config's top-level leadSessionId,
+/// so a nested one is never read), and reach a path only after they match `^[0-9a-f-]{36}$`. A missing folder prints
 /// nothing. It writes nothing on the machine.
 pub(crate) const SCRIPT: &str = r#"
 set -u
@@ -66,7 +66,33 @@ export LC_ALL=C
 cap=262144
 budget=1048576
 tab=$(printf '\t')
+nl='
+'
 printf 'NOW\t%s\n' "$(date +%s)"
+# The top-level leadSessionId of the JSON file $1 (the last one, as the parser keeps), or nothing.
+lead_of() {
+  awk 'BEGIN { RS = "\001" } {
+    n = length($0); d = 0; ins = 0; esc = 0; key = 0; want = 0; top = ""
+    for (i = 1; i <= n; i++) {
+      c = substr($0, i, 1)
+      if (ins) {
+        if (esc) esc = 0
+        else if (c == "\\") esc = 1
+        else if (c == "\"") {
+          ins = 0; v = (i - b <= 64) ? substr($0, b, i - b) : ""
+          if (want) { id = v; want = 0 } else key = (d == 1 && top == "{" && v == "leadSessionId")
+        }
+        continue
+      }
+      if (c == " " || c == "\t" || c == "\n" || c == "\r") continue
+      if (c == "\"") { ins = 1; b = i + 1; continue }
+      if (c == ":" && key) { want = 1; key = 0; continue }
+      key = 0; want = 0
+      if (c == "{" || c == "[") { if (d == 0 && top == "") top = c; d++ }
+      else if (c == "}" || c == "]") d--
+    }
+  } END { if (id != "") print id }' "$1" 2>/dev/null
+}
 plain() { [ "${#1}" -le 160 ] || return 1; case "$1" in ''|*[!A-Za-z0-9._:-]*) return 1 ;; esac; }
 emit() {
   size=$(wc -c < "$3" 2>/dev/null | tr -cd '0-9')
@@ -93,24 +119,33 @@ for f in "$HOME"/.claude/teams/*/config.json; do
   emit TEAM "$name" "$f"; rc=$?
   [ "$rc" -eq 1 ] && break
   [ "$rc" -eq 0 ] || continue
-  ids="$ids $(head -c $((cap + 1)) "$f" 2>/dev/null | grep -o '"leadSessionId"[[:space:]]*:[[:space:]]*"[0-9a-f-]*"' | head -n 4 | sed 's/.*"\([0-9a-f-]*\)"$/\1/')"
+  ids="$ids $(lead_of "$f")"
 done
-if stat -c %.3Y / 2>/dev/null | grep -Eq '^[0-9]+\.[0-9]+$'; then st() { stat -c "%.3Y${tab}%n" -- "$@"; }
-elif stat -f %Fm / 2>/dev/null | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then st() { stat -f "%Fm${tab}%N" -- "$@"; }
-elif stat -c %Y / 2>/dev/null | grep -Eq '^[0-9]+$'; then st() { stat -c "%Y${tab}%n" -- "$@"; }
-else st() { :; }; fi
+if stat -c %.3Y / 2>/dev/null | grep -Eq '^[0-9]+\.[0-9]+$'; then fmt=(-c "%.3Y${tab}%n")
+elif stat -f %Fm / 2>/dev/null | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then fmt=(-f "%Fm${tab}%N")
+elif stat -c %Y / 2>/dev/null | grep -Eq '^[0-9]+$'; then fmt=(-c "%Y${tab}%n")
+else fmt=(); fi
 all=0
 for id in $(for i in $ids; do printf '%s\n' "$i"; done | grep -E '^[0-9a-f-]{36}$' | sort -u); do
   set -- "$HOME"/.claude/projects/*/"$id"/subagents/agent-a*-????????????????.jsonl
   [ -e "$1" ] || { printf 'DONE\t%s\n' "$id"; continue; }
-  k=0; cut=
+  files=()
+  for f in "$@"; do
+    case "$f" in *"$nl"*|*"$tab"*) continue ;; esac
+    plain "${f##*/}" && files+=("$f")
+  done
+  k=0; cut=; stats=
+  if [ "${#files[@]}" -gt 0 ]; then
+    if [ "${#fmt[@]}" -eq 0 ]; then cut=1
+    else stats=$(printf '%s\0' "${files[@]}" | xargs -0 -n 500 stat "${fmt[@]}" -- 2>/dev/null) || cut=1; fi
+  fi
   while IFS="$tab" read -r t f; do
     case "$t" in ''|*[!0-9.]*|.*|*.|*.*.*) continue ;; esac
     name=${f##*/}; plain "$name" || continue
     k=$((k + 1)); if [ "$k" -gt 1000 ]; then printf 'CAP\ttranscripts\n'; cut=1; break; fi
     all=$((all + 1)); if [ "$all" -gt 5000 ]; then printf 'CAP\ttranscripts\n'; break 2; fi
     printf 'TRANSCRIPT\t%s\t%s\t%s\n' "$id" "$name" "$t"
-  done < <(st "$@" 2>/dev/null | sort -t "$tab" -k1,1 -rn)
+  done < <(printf '%s\n' "$stats" | sort -t "$tab" -k1,1 -rn)
   [ -n "$cut" ] || printf 'DONE\t%s\n' "$id"
 done
 "#;
@@ -396,17 +431,31 @@ pub(crate) fn remote_argv(machine: &Machine) -> Result<Vec<String>> {
 /// Runs `SCRIPT` on the machine: (exit code, stdout, stderr), within OUTPUT_CAP and DEADLINE.
 fn run_script(machine: &Machine) -> Result<(i32, String, String)> {
     if is_local(machine) {
-        return run_bounded(&["bash", "-s"], SCRIPT, OUTPUT_CAP, DEADLINE);
+        return run_bounded(&["bash", "-s"], SCRIPT, OUTPUT_CAP, deadline());
     }
     ensure_master(&machine.target)?;
     let args = remote_argv(machine)?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_bounded(&refs, SCRIPT, OUTPUT_CAP, DEADLINE)
+    run_bounded(&refs, SCRIPT, OUTPUT_CAP, deadline())
+}
+
+/// DEADLINE, which a debug build lets tests shorten with `HERDR_PORTAL_PROGRESS_DEADLINE_MS`.
+fn deadline() -> Duration {
+    if cfg!(debug_assertions) {
+        if let Some(ms) = std::env::var("HERDR_PORTAL_PROGRESS_DEADLINE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Duration::from_millis(ms);
+        }
+    }
+    DEADLINE
 }
 
 /// Runs `args` in a process group of its own, `input` on its stdin. Past `deadline`, or once stdout passes `limit`
-/// bytes, the whole group is killed (ssh and anything the script started) and the read fails with fixed text. The
-/// group is killed after a normal exit too, so nothing it left behind keeps running. stderr is kept up to 64 KiB.
+/// bytes, the whole group is killed (ssh and anything the script started) and the read fails with fixed text. After
+/// the child exits, the group is killed only if something it left behind still holds stdout open at the deadline:
+/// then the group still has a member, so its id can't have been reused. stderr is kept up to 64 KiB.
 fn run_bounded(
     args: &[&str],
     input: &str,
@@ -452,7 +501,7 @@ fn run_bounded(
         buf
     });
     let start = Instant::now();
-    let status = loop {
+    let mut status = loop {
         if let Some(status) = child.try_wait()? {
             break Some(status);
         }
@@ -463,7 +512,14 @@ fn run_bounded(
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    kill_group();
+    while status.is_some() && !(reader.is_finished() && errors.is_finished()) {
+        if over.load(Ordering::SeqCst) || start.elapsed() >= deadline {
+            kill_group();
+            status = None;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let _ = writer.join();
     let out = reader.join().unwrap_or_default();
     let err_text = String::from_utf8_lossy(&errors.join().unwrap_or_default()).into_owned();
@@ -803,6 +859,80 @@ mod tests {
         let (code, out, _) =
             run_bounded(&["sh", "-c", "cat"], "hello", 1024, Duration::from_secs(5)).unwrap();
         assert_eq!((code, out.as_str()), (0, "hello"));
+    }
+
+    /// SCRIPT's raw stream for a HOME built by `setup`, run here with bash.
+    fn raw_stream(name: &str, setup: impl Fn(&std::path::Path)) -> String {
+        let home = std::env::temp_dir().join(format!("hp-script-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        setup(&home);
+        let (code, out, err) = run_bounded_env(&["bash", "-s"], SCRIPT, &home);
+        let _ = fs::remove_dir_all(&home);
+        assert_eq!((code, err.as_str()), (0, ""));
+        out
+    }
+
+    fn run_bounded_env(
+        args: &[&str],
+        input: &str,
+        home: &std::path::Path,
+    ) -> (i32, String, String) {
+        let mut child = Command::new(args[0])
+            .args(&args[1..])
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn the_script_and_the_parser_share_one_name_limit() {
+        let out = raw_stream("names", |home| {
+            let dir = home.join(".herdr-projects/.progress");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(format!("{}.json", "a".repeat(155))), "{}").unwrap();
+            fs::write(dir.join(format!("{}.json", "b".repeat(156))), "{}").unwrap();
+        });
+        assert!(
+            out.contains(&format!("PROGRESS\t{}.json", "a".repeat(155))),
+            "{out}"
+        );
+        assert!(!out.contains(&"b".repeat(156)), "{out}");
+        assert!(plain_name(&format!("{}.json", "a".repeat(155))));
+        assert!(!plain_name(&format!("{}.json", "b".repeat(156))));
+    }
+
+    #[test]
+    fn a_team_too_large_to_send_gives_no_lead_to_read() {
+        let lead = "6a6b6c6d-0000-4000-8000-000000000006";
+        let out = raw_stream("toolarge", |home| {
+            let team = home.join(".claude/teams/big");
+            fs::create_dir_all(&team).unwrap();
+            let mut text = format!(r#"{{"leadSessionId":"{lead}","pad":""#);
+            text.push_str(&"x".repeat(FILE_CAP + 10));
+            text.push_str(r#""}"#);
+            fs::write(team.join("config.json"), text).unwrap();
+            let sub = home.join(format!(".claude/projects/p/{lead}/subagents"));
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("agent-ax-0123456789abcdef.jsonl"), "").unwrap();
+        });
+        assert!(out.contains("TOO_LARGE\tTEAM\tbig"), "{out}");
+        assert!(!out.contains(lead), "{out}");
     }
 
     #[test]
