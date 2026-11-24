@@ -217,6 +217,11 @@ fn rounds(doc: &Value) -> Vec<(String, u64)> {
 
 const DAY: u64 = 86_400;
 
+/// Root ignores permission bits, so a test that needs a denied directory can't run as root.
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1112,6 +1117,9 @@ fn a_dangling_month_link_alone_clears_complete() {
 /// empty and complete one.
 #[test]
 fn an_unreadable_history_or_one_that_is_a_file_or_a_fifo_is_internal_on_both_sides() {
+    if is_root() {
+        return;
+    }
     for (case, remote) in [
         ("unreadable", false),
         ("unreadable", true),
@@ -1159,5 +1167,55 @@ fn an_unreadable_history_or_one_that_is_a_file_or_a_fifo_is_internal_on_both_sid
         assert!(!ok, "{name}: {doc}");
         assert_eq!(doc["error"]["code"], "internal", "{name}: {doc}");
         assert!(!doc.to_string().contains("q-hidden"), "{name}: {doc}");
+    }
+}
+
+/// A missing history behind a parent that can't be searched can't be told from an empty one, so it fails as internal
+/// on both sides (1186), with the fixed message and no OS error text. Over ssh the parent can be further up. A
+/// parent that can be searched but not listed still shows the history is missing: empty and complete.
+#[test]
+fn a_history_behind_an_unsearchable_parent_is_internal_on_both_sides() {
+    if is_root() {
+        return;
+    }
+    for (mode, up, remote) in [
+        (0o600, 1, false),
+        (0o600, 1, true),
+        (0o000, 1, false),
+        (0o000, 1, true),
+        (0o600, 2, true),
+        (0o300, 1, false),
+        (0o300, 1, true),
+    ] {
+        let side = if remote { "remote" } else { "local" };
+        let name = format!("odd-parent-{mode:o}-{up}-{side}");
+        let fixture = Fixture::new(&name);
+        let dir = if remote {
+            fixture.remote_history()
+        } else {
+            fixture.history()
+        };
+        let parent = dir.ancestors().nth(up).unwrap().to_path_buf();
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(mode)).unwrap();
+        let (ok, doc) = fixture.read(&[if remote { "devbox" } else { "Local" }], &[]);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        if mode == 0o300 {
+            assert!(ok, "{name}: {doc}");
+            assert_eq!(doc["events"], serde_json::json!([]), "{name}: {doc}");
+            assert_eq!(doc["complete"], true, "{name}: {doc}");
+            continue;
+        }
+        assert!(!ok, "{name}: {doc}");
+        assert_eq!(doc["error"]["code"], "internal", "{name}: {doc}");
+        assert_eq!(
+            doc["error"]["message"], "The history read on the machine failed.",
+            "{name}: {doc}"
+        );
+        let text = doc.to_string();
+        assert!(
+            !text.contains("os error") && !text.contains("denied"),
+            "{name}: {doc}"
+        );
     }
 }
