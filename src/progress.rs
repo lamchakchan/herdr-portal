@@ -10,6 +10,8 @@
 
 use super::*;
 use api::{err, err_with, parse_args, print_json};
+use std::io::Read;
+use std::time::{Duration, Instant};
 
 /// The JSON shape's version: Headway accepts only schemas it knows.
 pub(crate) const SCHEMA: u32 = 1;
@@ -17,7 +19,16 @@ pub(crate) const SCHEMA: u32 = 1;
 const FILE_CAP: usize = 256 * 1024;
 const PROGRESS_CAP: usize = 500;
 const TEAMS_CAP: usize = 100;
-const TRANSCRIPTS_CAP: usize = 500;
+/// Transcripts per lead (newest first), and in all.
+const LEAD_TRANSCRIPTS_CAP: usize = 1000;
+const TRANSCRIPTS_CAP: usize = 5000;
+/// Characters kept of any string value.
+const TEXT_CAP: usize = 256;
+/// Longest file or folder name kept, the same in the script and here.
+const NAME_CAP: usize = 160;
+/// The read's whole output, and its deadline (ssh's ConnectTimeout does not cover a mux client).
+const OUTPUT_CAP: usize = 4 * 1024 * 1024;
+const DEADLINE: Duration = Duration::from_secs(20);
 
 const PROGRESS_KEYS: [(&str, Kind); 6] = [
     ("pane_id", Kind::Text),
@@ -30,32 +41,37 @@ const PROGRESS_KEYS: [(&str, Kind); 6] = [
 const MEMBER_KEYS: [(&str, Kind); 3] = [
     ("name", Kind::Text),
     ("agentType", Kind::Text),
-    ("joinedAt", Kind::Number),
+    ("joinedAt", Kind::TextOrNumber),
 ];
 /// Base64 text of one frame past which the body is no longer kept: FILE_CAP + 1 bytes, encoded, and some slack.
 const BODY_CAP: usize = (FILE_CAP + 1).div_ceil(3) * 4 + 4096;
 
 pub(crate) const PROGRESS_FAILED: &str = "The progress read on the machine failed.";
+pub(crate) const PROGRESS_SLOW: &str = "The progress read on the machine took too long.";
+pub(crate) const PROGRESS_TOO_BIG: &str = "The progress read on the machine printed too much.";
 
 /// Runs on the machine as `bash -s`. It prints one framed stream: `NOW\t<epoch s>`; per file `PROGRESS\t<name>` or
 /// `TEAM\t<dir>`, its first 256 KiB + 1 byte as base64 lines, then `END` (never a base64 line, whose length is a
 /// multiple of 4); `TOO_LARGE\t<kind>\t<name>`, with no body, for a file past 256 KiB; per teammate transcript
-/// `TRANSCRIPT\t<lead id>\t<name>\t<mtime s>`; and `CAP\t<what>` when a cap stopped a section. Records and team configs
-/// each have a 1 MiB budget, so a full records folder still leaves the teams. A name with any character outside
-/// `[A-Za-z0-9._:-]` (a newline would break the framing) is skipped. Lead ids come only from the teams listed, and
-/// reach a path only after they match `^[0-9a-f-]{36}$`. A missing folder prints nothing. It writes nothing on the
-/// machine.
+/// `TRANSCRIPT\t<lead id>\t<name>\t<mtime s>`, newest first; `DONE\t<lead id>` once a lead's transcripts are all
+/// listed; and `CAP\t<what>` when a cap stopped a section. Records and team configs each have a 1 MiB budget, so a
+/// full records folder still leaves the teams. Transcripts: at most 1000 per lead and 5000 in all; a lead cut short
+/// gets no `DONE`. A name longer than 160 bytes or with any character outside `[A-Za-z0-9._:-]` (a newline would
+/// break the framing) is skipped. Lead ids come only from teams sent whole (at most 4 per config, so a nested id
+/// cannot hide the real one), and reach a path only after they match `^[0-9a-f-]{36}$`. A missing folder prints
+/// nothing. It writes nothing on the machine.
 pub(crate) const SCRIPT: &str = r#"
 set -u
 export LC_ALL=C
 cap=262144
 budget=1048576
+tab=$(printf '\t')
 printf 'NOW\t%s\n' "$(date +%s)"
-plain() { case "$1" in ''|*[!A-Za-z0-9._:-]*) return 1 ;; esac; }
+plain() { [ "${#1}" -le 160 ] || return 1; case "$1" in ''|*[!A-Za-z0-9._:-]*) return 1 ;; esac; }
 emit() {
   size=$(wc -c < "$3" 2>/dev/null | tr -cd '0-9')
   size=${size:-0}
-  if [ "$size" -gt "$cap" ]; then printf 'TOO_LARGE\t%s\t%s\n' "$1" "$2"; return 0; fi
+  if [ "$size" -gt "$cap" ]; then printf 'TOO_LARGE\t%s\t%s\n' "$1" "$2"; return 2; fi
   total=$((total + size))
   if [ "$total" -gt "$budget" ]; then printf 'CAP\t%s\n' "$1"; return 1; fi
   printf '%s\t%s\n' "$1" "$2"
@@ -67,33 +83,42 @@ for f in "$HOME"/.herdr-projects/.progress/*.json; do
   [ -f "$f" ] || continue
   name=${f##*/}; plain "$name" || continue
   n=$((n + 1)); if [ "$n" -gt 500 ]; then printf 'CAP\tprogress\n'; break; fi
-  emit PROGRESS "$name" "$f" || break
+  emit PROGRESS "$name" "$f"; [ "$?" -eq 1 ] && break
 done
 total=0; n=0; ids=
 for f in "$HOME"/.claude/teams/*/config.json; do
   [ -f "$f" ] || continue
   d=${f%/config.json}; name=${d##*/}; plain "$name" || continue
   n=$((n + 1)); if [ "$n" -gt 100 ]; then printf 'CAP\tteams\n'; break; fi
-  emit TEAM "$name" "$f" || break
-  ids="$ids $(head -c $((cap + 1)) "$f" 2>/dev/null | grep -o '"leadSessionId"[[:space:]]*:[[:space:]]*"[0-9a-f-]*"' | sed 's/.*"\([0-9a-f-]*\)"$/\1/')"
+  emit TEAM "$name" "$f"; rc=$?
+  [ "$rc" -eq 1 ] && break
+  [ "$rc" -eq 0 ] || continue
+  ids="$ids $(head -c $((cap + 1)) "$f" 2>/dev/null | grep -o '"leadSessionId"[[:space:]]*:[[:space:]]*"[0-9a-f-]*"' | head -n 4 | sed 's/.*"\([0-9a-f-]*\)"$/\1/')"
 done
-n=0
-for id in $ids; do printf '%s\n' "$id"; done | grep -E '^[0-9a-f-]{36}$' | sort -u |
-while read -r id; do
-  for f in "$HOME"/.claude/projects/*/"$id"/subagents/agent-a*.jsonl; do
-    [ -f "$f" ] || continue
+if stat -c %.3Y / 2>/dev/null | grep -Eq '^[0-9]+\.[0-9]+$'; then st() { stat -c "%.3Y${tab}%n" -- "$@"; }
+elif stat -f %Fm / 2>/dev/null | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then st() { stat -f "%Fm${tab}%N" -- "$@"; }
+elif stat -c %Y / 2>/dev/null | grep -Eq '^[0-9]+$'; then st() { stat -c "%Y${tab}%n" -- "$@"; }
+else st() { :; }; fi
+all=0
+for id in $(for i in $ids; do printf '%s\n' "$i"; done | grep -E '^[0-9a-f-]{36}$' | sort -u); do
+  set -- "$HOME"/.claude/projects/*/"$id"/subagents/agent-a*-????????????????.jsonl
+  [ -e "$1" ] || { printf 'DONE\t%s\n' "$id"; continue; }
+  k=0; cut=
+  while IFS="$tab" read -r t f; do
+    case "$t" in ''|*[!0-9.]*|.*|*.|*.*.*) continue ;; esac
     name=${f##*/}; plain "$name" || continue
-    n=$((n + 1)); if [ "$n" -gt 500 ]; then printf 'CAP\ttranscripts\n'; break 2; fi
-    t=$(stat -c %.3Y "$f" 2>/dev/null || stat -f %Fm "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null) || continue
+    k=$((k + 1)); if [ "$k" -gt 1000 ]; then printf 'CAP\ttranscripts\n'; cut=1; break; fi
+    all=$((all + 1)); if [ "$all" -gt 5000 ]; then printf 'CAP\ttranscripts\n'; break 2; fi
     printf 'TRANSCRIPT\t%s\t%s\t%s\n' "$id" "$name" "$t"
-  done
+  done < <(st "$@" 2>/dev/null | sort -t "$tab" -k1,1 -rn)
+  [ -n "$cut" ] || printf 'DONE\t%s\n' "$id"
 done
 "#;
 
 /// A base name the output may carry: plain characters only (no path, no control or separator characters).
 fn plain_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 160
+        && name.len() <= NAME_CAP
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
@@ -145,15 +170,38 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
 enum Kind {
     Text,
     Number,
+    /// `joinedAt`: ms epoch, or an ISO string as some Claude Code versions write it.
+    TextOrNumber,
 }
 
 impl Kind {
-    fn holds(self, value: &Value) -> bool {
-        match self {
-            Kind::Text => value.is_string(),
-            Kind::Number => value.is_number(),
+    /// The value to keep, or None. Text loses control and format characters and is cut to TEXT_CAP characters.
+    /// Numbers pass unchanged: a caller clamps them.
+    fn kept(self, value: &Value) -> Option<Value> {
+        match (self, value) {
+            (Kind::Text | Kind::TextOrNumber, Value::String(text)) => {
+                Some(Value::String(clean_text(text)))
+            }
+            (Kind::Number | Kind::TextOrNumber, Value::Number(_)) => Some(value.clone()),
+            _ => None,
         }
     }
+}
+
+/// A Unicode format character (category Cf): bidi overrides, zero-width marks and the like.
+fn is_format(c: char) -> bool {
+    matches!(u32::from(c),
+        0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2 | 0x180E | 0x200B..=0x200F
+        | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD
+        | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// Text as it may be printed: control (Cc) and format (Cf) characters removed, at most TEXT_CAP characters.
+fn clean_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() && !is_format(*c))
+        .take(TEXT_CAP)
+        .collect()
 }
 
 /// The keys asked for, from an object, when their value has the kind asked for; everything else dropped.
@@ -163,8 +211,8 @@ fn only(value: &Value, keys: &[(&str, Kind)]) -> Option<Value> {
         keys.iter()
             .filter_map(|(k, kind)| {
                 map.get(*k)
-                    .filter(|v| kind.holds(v))
-                    .map(|v| ((*k).to_string(), v.clone()))
+                    .and_then(|v| kind.kept(v))
+                    .map(|v| ((*k).to_string(), v))
             })
             .collect(),
     ))
@@ -192,8 +240,8 @@ fn team_config(bytes: &[u8]) -> Result<Value, &'static str> {
     let doc: Value = serde_json::from_slice(bytes).map_err(|_| "bad_json")?;
     let map = doc.as_object().ok_or("bad_json")?;
     let mut config = serde_json::Map::new();
-    if let Some(lead) = map.get("leadSessionId").filter(|v| v.is_string()) {
-        config.insert("leadSessionId".into(), lead.clone());
+    if let Some(lead) = map.get("leadSessionId").and_then(|v| Kind::Text.kept(v)) {
+        config.insert("leadSessionId".into(), lead);
     }
     if let Some(members) = map.get("members").and_then(Value::as_array) {
         config.insert(
@@ -222,13 +270,23 @@ pub(crate) struct Collected {
 pub(crate) fn parse_stream(text: &str) -> Result<Collected> {
     let mut out = Collected::default();
     let mut now = None;
+    let mut clock_seen = false;
     let mut transcripts: Vec<(String, Value)> = Vec::new();
+    let mut per_lead: HashMap<String, usize> = HashMap::new();
+    let mut done: HashSet<String> = HashSet::new();
+    let mut capped: HashSet<String> = HashSet::new();
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
         let fields: Vec<&str> = line.split('\t').collect();
         match fields.as_slice() {
-            // The first only: a later one could only come from a name that broke the framing.
-            ["NOW", secs] if now.is_none() => now = secs.trim().parse::<i64>().ok(),
+            // The first only, parsed or not: a later one could only come from a name that broke the framing.
+            ["NOW", secs] if !clock_seen => {
+                clock_seen = true;
+                now = secs.trim().parse::<i64>().ok();
+            }
+            ["DONE", id] if is_lead_id(id) => {
+                done.insert(id.to_string());
+            }
             ["TOO_LARGE", kind @ ("PROGRESS" | "TEAM"), name] if plain_name(name) => {
                 if *kind == "PROGRESS" {
                     if out.progress.len() >= PROGRESS_CAP {
@@ -281,7 +339,7 @@ pub(crate) fn parse_stream(text: &str) -> Result<Collected> {
                         continue;
                     }
                     out.teams.push(match team_config(&bytes) {
-                        Ok(config) => json!({"team": name, "config": config, "transcripts": []}),
+                        Ok(config) => json!({"team": name, "config": config, "transcripts": [], "transcripts_complete": false}),
                         Err(why) => json!({"team": name, "error": why}),
                     });
                 }
@@ -296,10 +354,13 @@ pub(crate) fn parse_stream(text: &str) -> Result<Collected> {
                 if !secs.is_finite() || secs < 0.0 {
                     continue;
                 }
-                if transcripts.len() >= TRANSCRIPTS_CAP {
+                let mine = per_lead.entry(id.to_string()).or_default();
+                if transcripts.len() >= TRANSCRIPTS_CAP || *mine >= LEAD_TRANSCRIPTS_CAP {
                     out.truncated = true;
+                    capped.insert(id.to_string());
                     continue;
                 }
+                *mine += 1;
                 transcripts.push((
                     id.to_string(),
                     json!({"name": name, "mtime_ms": (secs * 1000.0).round() as i64}),
@@ -318,6 +379,9 @@ pub(crate) fn parse_stream(text: &str) -> Result<Collected> {
             .map(|(_, t)| t.clone())
             .collect();
         team["transcripts"] = Value::Array(mine);
+        // Complete only when the script listed every one of the lead's transcripts: a teammate missing from a cut list
+        // has an unknown state, not "no transcript yet".
+        team["transcripts_complete"] = json!(done.contains(&lead) && !capped.contains(&lead));
     }
     Ok(out)
 }
@@ -329,15 +393,102 @@ pub(crate) fn remote_argv(machine: &Machine) -> Result<Vec<String>> {
     Ok(args)
 }
 
-/// Runs `SCRIPT` on the machine: (exit code, stdout, stderr).
+/// Runs `SCRIPT` on the machine: (exit code, stdout, stderr), within OUTPUT_CAP and DEADLINE.
 fn run_script(machine: &Machine) -> Result<(i32, String, String)> {
     if is_local(machine) {
-        return run_cmd(&["bash", "-s"], Some(SCRIPT));
+        return run_bounded(&["bash", "-s"], SCRIPT, OUTPUT_CAP, DEADLINE);
     }
     ensure_master(&machine.target)?;
     let args = remote_argv(machine)?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cmd(&refs, Some(SCRIPT))
+    run_bounded(&refs, SCRIPT, OUTPUT_CAP, DEADLINE)
+}
+
+/// Runs `args` in a process group of its own, `input` on its stdin. Past `deadline`, or once stdout passes `limit`
+/// bytes, the whole group is killed (ssh and anything the script started) and the read fails with fixed text. The
+/// group is killed after a normal exit too, so nothing it left behind keeps running. stderr is kept up to 64 KiB.
+fn run_bounded(
+    args: &[&str],
+    input: &str,
+    limit: usize,
+    deadline: Duration,
+) -> Result<(i32, String, String)> {
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let mut child = Command::new(args[0])
+        .args(&args[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| spawn_failure(args[0], &e))?;
+    let group = child.id() as i32;
+    let kill_group = || unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    };
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let text = input.to_string();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(text.as_bytes());
+    });
+    let over = Arc::new(AtomicBool::new(false));
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let flag = Arc::clone(&over);
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut stdout).take(limit as u64 + 1).read_to_end(&mut buf);
+        if buf.len() > limit {
+            flag.store(true, Ordering::SeqCst);
+        }
+        buf
+    });
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let errors = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut buf);
+        let _ = io::copy(&mut stderr, &mut io::sink());
+        buf
+    });
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if over.load(Ordering::SeqCst) || start.elapsed() >= deadline {
+            kill_group();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    kill_group();
+    let _ = writer.join();
+    let out = reader.join().unwrap_or_default();
+    let err_text = String::from_utf8_lossy(&errors.join().unwrap_or_default()).into_owned();
+    match status {
+        Some(_) if over.load(Ordering::SeqCst) => Err(err_with(
+            "internal",
+            PROGRESS_TOO_BIG,
+            "output over the limit",
+        )),
+        Some(status) => Ok((
+            status.code().unwrap_or(1),
+            String::from_utf8_lossy(&out).into_owned(),
+            err_text,
+        )),
+        None if over.load(Ordering::SeqCst) => Err(err_with(
+            "internal",
+            PROGRESS_TOO_BIG,
+            "output over the limit",
+        )),
+        None => Err(err_with(
+            "internal",
+            PROGRESS_SLOW,
+            format!("no answer within {} s", deadline.as_secs()),
+        )),
+    }
 }
 
 /// One read through `run` (the real one runs `SCRIPT`; tests pass a fake): the JSON `progress --json` prints.
@@ -531,7 +682,7 @@ mod tests {
     #[test]
     fn a_kept_key_holding_an_object_or_the_wrong_type_is_dropped() {
         let record = br#"{"pane_id":{"prompt":"SENTINEL-PROMPT"},"terminal_id":"t","percent":"55","activity":["SENTINEL-PROMPT"],"reported_at":1,"session_started_at":1}"#;
-        let config = br#"{"leadSessionId":{"prompt":"SENTINEL-PROMPT"},"members":[{"name":"m","agentType":{"prompt":"SENTINEL-PROMPT"},"joinedAt":"x"}]}"#;
+        let config = br#"{"leadSessionId":{"prompt":"SENTINEL-PROMPT"},"members":[{"name":"m","agentType":{"prompt":"SENTINEL-PROMPT"},"joinedAt":{"t":1}}]}"#;
         let found = parse_stream(&format!(
             "NOW\t5\n{}{}",
             frame("PROGRESS", "p.json", record),
@@ -585,9 +736,73 @@ mod tests {
     }
 
     #[test]
-    fn the_script_skips_names_that_could_break_the_framing() {
-        assert!(SCRIPT.contains("*[!A-Za-z0-9._:-]*) return 1"));
-        assert!(SCRIPT.contains("export LC_ALL=C"));
+    fn a_join_time_may_be_iso_text_and_kept_text_loses_control_and_format_characters() {
+        let config = "{\"leadSessionId\":\"0f3c2a1e-5b6d-4e7f-8a9b-0c1d2e3f4a5b\",\"members\":[{\"name\":\"a\\u202eb\\u009bc\\u200b\",\"agentType\":\"x\",\"joinedAt\":\"2026-11-24T10:00:00Z\"}]}";
+        let record = format!(
+            "{{\"pane_id\":\"w1:p1\",\"terminal_id\":\"t\",\"activity\":\"{}\"}}",
+            "y".repeat(400)
+        );
+        let found = parse_stream(&format!(
+            "NOW\t5\n{}{}",
+            frame("TEAM", "t", config.as_bytes()),
+            frame("PROGRESS", "p.json", record.as_bytes())
+        ))
+        .unwrap();
+        assert_eq!(
+            found.teams[0]["config"]["members"],
+            json!([{"name": "abc", "agentType": "x", "joinedAt": "2026-11-24T10:00:00Z"}])
+        );
+        assert_eq!(
+            found.progress[0]["record"]["activity"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            TEXT_CAP
+        );
+    }
+
+    #[test]
+    fn a_clock_that_does_not_parse_is_no_clock_even_with_a_later_one() {
+        assert!(parse_stream("NOW\tsoon\nNOW\t5\n").is_err());
+    }
+
+    #[test]
+    fn a_read_past_its_deadline_is_stopped_with_everything_it_started() {
+        let dir = std::env::temp_dir().join(format!("hp-bounded-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
+        let start = Instant::now();
+        let e =
+            run_bounded(&["sh", "-c", &script], "", 1024, Duration::from_millis(500)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(api::json_message(&e), PROGRESS_SLOW);
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the background sleep still runs"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_past_its_size_limit_is_stopped() {
+        let start = Instant::now();
+        let e =
+            run_bounded(&["sh", "-c", "yes"], "", 64 * 1024, Duration::from_secs(20)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(api::json_message(&e), PROGRESS_TOO_BIG);
+        let (code, out, _) =
+            run_bounded(&["sh", "-c", "cat"], "hello", 1024, Duration::from_secs(5)).unwrap();
+        assert_eq!((code, out.as_str()), (0, "hello"));
     }
 
     #[test]

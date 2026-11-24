@@ -309,3 +309,128 @@ fn an_ambiguous_selector_names_no_target() {
         "{stdout}"
     );
 }
+
+const LEAD2: &str = "2a2b2c2d-0000-4000-8000-000000000002";
+const LEAD3: &str = "3a3b3c3d-0000-4000-8000-000000000003";
+const NEST: &str = "4a4b4c4d-0000-4000-8000-000000000004";
+
+fn subagents(fixture: &Fixture, lead: &str) -> PathBuf {
+    let dir = fixture.dir.join(format!(
+        "home/.claude/projects/-Users-x-repo/{lead}/subagents"
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn team_of(doc: &Value, name: &str) -> Value {
+    doc["teams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["team"] == name)
+        .unwrap_or_else(|| panic!("no team {name}: {doc}"))
+        .clone()
+}
+
+#[test]
+fn a_lead_with_many_sub_agents_keeps_its_teammates_and_says_when_its_list_is_cut() {
+    let fixture = Fixture::new("many");
+    let teams = fixture.dir.join("home/.claude/teams");
+    // "big": 600 other sub-agents and a teammate whose name sorts last.
+    fs::create_dir_all(teams.join("big")).unwrap();
+    fs::write(
+        teams.join("big/config.json"),
+        format!(r#"{{"leadSessionId":"{LEAD2}","members":[{{"name":"zz-last","agentType":"g","joinedAt":1}}]}}"#),
+    )
+    .unwrap();
+    let dir = subagents(&fixture, LEAD2);
+    for i in 0..600 {
+        fs::write(
+            dir.join(format!("agent-aother{i:04}-0123456789abcdef.jsonl")),
+            "",
+        )
+        .unwrap();
+    }
+    fs::write(dir.join("agent-azz-last-0123456789abcdef.jsonl"), "").unwrap();
+    // "huge": 1100 sub-agents, past the per-lead cap; its teammate wrote last, so it is among the newest kept.
+    fs::create_dir_all(teams.join("huge")).unwrap();
+    fs::write(
+        teams.join("huge/config.json"),
+        format!(r#"{{"leadSessionId":"{LEAD3}","members":[{{"name":"newest","agentType":"g","joinedAt":1}}]}}"#),
+    )
+    .unwrap();
+    let dir = subagents(&fixture, LEAD3);
+    for i in 0..1100 {
+        fs::write(
+            dir.join(format!("agent-aold{i:04}-0123456789abcdef.jsonl")),
+            "",
+        )
+        .unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(dir.join("agent-anewest-0123456789abcdef.jsonl"), "").unwrap();
+
+    let (ok, stdout, stderr) = fixture.run(&["progress", "devbox", "--json"]);
+    assert!(ok, "{stdout}{stderr}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let names = |t: &Value| -> Vec<String> {
+        t["transcripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let big = team_of(&doc, "big");
+    assert!(names(&big).contains(&"agent-azz-last-0123456789abcdef.jsonl".to_string()));
+    assert_eq!(big["transcripts_complete"], true);
+    let huge = team_of(&doc, "huge");
+    assert_eq!(huge["transcripts_complete"], false);
+    assert_eq!(names(&huge)[0], "agent-anewest-0123456789abcdef.jsonl");
+    // The other teams still get theirs.
+    let squad = team_of(&doc, "squad");
+    assert_eq!(squad["transcripts_complete"], true);
+    assert_eq!(names(&squad), ["agent-aimpl-x-0123456789abcdef.jsonl"]);
+}
+
+#[test]
+fn a_nested_lead_id_neither_hides_the_real_lead_nor_costs_another_team() {
+    let fixture = Fixture::new("nested");
+    let teams = fixture.dir.join("home/.claude/teams");
+    fs::create_dir_all(teams.join("nested")).unwrap();
+    fs::write(
+        teams.join("nested/config.json"),
+        format!(r#"{{"members":[{{"name":"n1","x":{{"leadSessionId":"{NEST}"}}}}],"leadSessionId":"{LEAD2}"}}"#),
+    )
+    .unwrap();
+    fs::write(
+        subagents(&fixture, LEAD2).join("agent-an1-0123456789abcdef.jsonl"),
+        "",
+    )
+    .unwrap();
+    let dir = subagents(&fixture, NEST);
+    for i in 0..600 {
+        fs::write(
+            dir.join(format!("agent-ax{i:04}-0123456789abcdef.jsonl")),
+            "",
+        )
+        .unwrap();
+    }
+    let (ok, stdout, stderr) = fixture.run(&["progress", "devbox", "--json"]);
+    assert!(ok, "{stdout}{stderr}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let nested = team_of(&doc, "nested");
+    assert_eq!(
+        nested["transcripts"].as_array().unwrap().len(),
+        1,
+        "{nested}"
+    );
+    assert_eq!(nested["transcripts_complete"], true);
+    assert_eq!(
+        team_of(&doc, "squad")["transcripts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}

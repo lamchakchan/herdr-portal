@@ -279,7 +279,8 @@ remote agent's progress and teammates.
   ],
   "teams": [
     {"team": "squad", "config": {"leadSessionId": "…", "members": [{"name": "impl-x", "agentType": "…", "joinedAt": 1763990000000}]},
-     "transcripts": [{"name": "agent-aimpl-x-0123456789abcdef.jsonl", "mtime_ms": 1763999950000}]}
+     "transcripts": [{"name": "agent-aimpl-x-0123456789abcdef.jsonl", "mtime_ms": 1763999950000}],
+     "transcripts_complete": true}
   ],
   "truncated": false
 }
@@ -288,13 +289,21 @@ remote agent's progress and teammates.
 - `now` is the machine's own clock, in epoch seconds, so a caller can judge staleness without clock skew.
 - A record keeps only the six keys shown. A team keeps only `leadSessionId` and each member's `name`, `agentType` and
   `joinedAt`. Every other key, a member's `prompt` first of all, is dropped before printing.
+- A kept value is a string or a number, as its key expects (`joinedAt` may be either), or it is dropped. Strings lose
+  control and format characters and are cut to 256 characters. Numbers pass unchanged, whatever their size or sign, so
+  a consumer must clamp them (a percent to 0–100, a time to a sane range).
+- `transcripts` lists the lead's teammate transcripts newest first, at most 1000 per lead. `transcripts_complete` is
+  false when that list was cut, or the lead's folder wasn't read: a teammate missing from it has an unknown state, not
+  "no transcript yet".
 - Nothing is logged or written.
 - An entry's `error` is `bad_json`, or `too_large` past 256 KiB.
 - A missing folder gives `[]`.
-- `truncated` is true when a cap stopped the read: 500 records, 100 teams, 500 transcripts, or 1 MiB each of records
-  and of team configs. A file past 256 KiB sends no content, only its name, and counts toward neither budget.
+- `truncated` is true when a cap stopped the read: 500 records, 100 teams, 1000 transcripts for one lead or 5000 in
+  all, or 1 MiB each of records and of team configs. A file past 256 KiB sends no content, only its name, and counts toward neither budget.
 - One fixed script runs per call, over the machine's SSH master. It interpolates nothing, and a lead id becomes part
   of a path only once it matches `^[0-9a-f-]{36}$`.
+- The read has 20 s and 4 MiB of output. Past either, the portal kills ssh, or the local script, with everything it
+  started, and fails with `internal`.
 - An older portal answers `invalid_args` for this command.
 
 ## Agent requests
