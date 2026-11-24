@@ -5,6 +5,7 @@
 //! `complete` is false whenever a line was dropped or anything was cut.
 
 use super::*;
+use crate::event::plain_number;
 use crate::history::{month_file, parse_line, Event};
 use crate::progress::{deadline_for, decode_base64, run_bounded, ReadTexts};
 use api::{err, err_with, parse_args, print_json};
@@ -223,6 +224,7 @@ fn events_of(read: Found, since: u64) -> (Vec<Event>, bool) {
     let mut complete = !read.capped;
     let mut events = Vec::new();
     for chunk in &read.chunks {
+        // A byte that isn't UTF-8 becomes U+FFFD, which no field's pattern takes, so its line is dropped below.
         let text = String::from_utf8_lossy(&chunk.bytes);
         let mut body: &str = &text;
         if chunk.cut {
@@ -243,9 +245,6 @@ fn events_of(read: Found, since: u64) -> (Vec<Event>, bool) {
                 }
                 None => complete = false,
             }
-        }
-        if text.contains('\u{FFFD}') {
-            complete = false;
         }
     }
     events.sort_by_key(|e| e.at);
@@ -269,11 +268,8 @@ pub(crate) fn cmd_history(args: &[String], json_out: bool) -> Result<()> {
     let since = match args.flags.get("--since") {
         None => now.saturating_sub(DEFAULT_WINDOW),
         Some(v) => {
-            let since: u64 =
-                (!v.is_empty() && v.len() <= 10 && v.bytes().all(|b| b.is_ascii_digit()))
-                    .then(|| v.parse().ok())
-                    .flatten()
-                    .ok_or_else(|| err("invalid_args", "--since is epoch seconds."))?;
+            let since =
+                plain_number(v).ok_or_else(|| err("invalid_args", "--since is epoch seconds."))?;
             if since < now.saturating_sub(OLDEST_WINDOW) {
                 return Err(err("invalid_args", "--since may be at most 400 days back."));
             }
@@ -408,6 +404,60 @@ mod tests {
                 capped: true,
             },
             0,
+        );
+        assert!(!complete);
+    }
+
+    fn chunk(text: &[u8]) -> Found {
+        Found {
+            now: 0,
+            chunks: vec![Chunk {
+                bytes: text.to_vec(),
+                cut: false,
+            }],
+            capped: false,
+        }
+    }
+
+    /// An `at` inside the schema's range.
+    const T: u64 = 1_796_000_000;
+
+    fn fix(work: &str, at: u64) -> String {
+        format!(r#"{{"schema":1,"at":{at},"kind":"fix","work":"{work}","round":1}}"#)
+    }
+
+    #[test]
+    fn since_keeps_events_at_or_after_it_and_drops_older_ones_quietly() {
+        let text = format!(
+            "{}\n{}\n{}\n",
+            fix("q-old", T - 1),
+            fix("q-at", T),
+            fix("q-new", T + 1)
+        );
+        let (events, complete) = events_of(chunk(text.as_bytes()), T);
+        assert_eq!(
+            events.iter().map(|e| e.work.as_str()).collect::<Vec<_>>(),
+            ["q-at", "q-new"]
+        );
+        assert!(complete, "an event before since is filtered, not lost");
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_is_dropped_and_clears_complete() {
+        let text = format!(
+            "{}\n{}\n{}\n",
+            fix("q-a", T),
+            fix("q-b", T + 1),
+            fix("q-c", T + 2)
+        );
+        let mut text = text.into_bytes();
+        // The `b` of `q-b` becomes a byte that is not UTF-8.
+        let at = text.windows(3).position(|w| w == b"q-b").unwrap() + 2;
+        text[at] = 0xff;
+        let (events, complete) = events_of(chunk(&text), 0);
+        assert_eq!(
+            events.iter().map(|e| e.work.as_str()).collect::<Vec<_>>(),
+            ["q-a", "q-c"]
         );
         assert!(!complete);
     }

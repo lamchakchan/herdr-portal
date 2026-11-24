@@ -764,9 +764,14 @@ fn tree(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
 fn a_bad_since_or_usage_is_invalid_args() {
     let fixture = Fixture::new("usage");
     let old = (now() - 401 * DAY).to_string();
+    // Inside the window, but not plain digits: Rust's parse would take both.
+    let signed = format!("+{}", now() - DAY);
+    let padded = format!("0{}", now() - DAY);
     for args in [
         vec!["Local", "--since", "soon"],
         vec!["Local", "--since", "+5"],
+        vec!["Local", "--since", &signed],
+        vec!["Local", "--since", &padded],
         vec!["Local", "--since", &old],
         vec![],
         vec!["Local", "devbox"],

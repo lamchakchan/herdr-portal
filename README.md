@@ -193,6 +193,7 @@ The API for agents and scripts is the CLI with `--json`. It doesn't run a server
 | Remote ports not forwarded | `scan <machine> --json --state available` |
 | Agent progress and teams | `progress <machine> --json` |
 | Record a work-history event here | `event <kind> --work <id> [--field value …] [--json]` |
+| Read a machine's work history | `history <machine> --json [--since <epoch s>]` |
 | Open a forward | `add <machine> <port> [--local-port N] --json` |
 | Close a forward | `stop <local-port> --json` (add `--keep` to pause it instead) |
 | Resume a paused forward | `start <local-port> --json` |
@@ -376,6 +377,33 @@ herdr-portal event end    --work AT-3400 --outcome done
   `complete: false`, so old Headways show less, never something wrong.
 - **Callers skip** when the binary is missing (exit 127) or answers `invalid_args` for `event`, as a portal older than
   the command does. A missing history must never stop the work.
+
+### Reading it
+
+`history <machine> --json [--since <epoch s>]` returns the events at or after `since`, oldest first. `Local` reads
+this machine's files directly. Any other machine is read over its SSH master by one fixed script, which writes nothing
+there.
+
+```json
+{"ok": true, "schema": 1, "machine": "devbox", "now": 1796000000,
+ "events": [{"schema": 1, "at": 1795990000, "kind": "fix", "work": "AT-3400", "round": 1}],
+ "complete": true}
+```
+
+- `since` defaults to 7 days before now and may be at most 400 days back. It is plain digits, like an event's
+  numbers. Anything else fails with `invalid_args`.
+- `machine` is the label the caller passed, never the SSH target. A line holds no machine of its own.
+- `now` is the read machine's clock, in epoch seconds.
+- The read starts at the month of `since` minus one day, so a clock a little behind still finds its lines.
+- **`complete` is false** when anything was left out:
+  - a line that isn't a valid schema 1 event, from a newer writer or a damaged file, is dropped;
+  - two lines merged by a cut write are dropped, and the lines after them are still read;
+  - more than 2 MiB of files: the newest months are read first, and the oldest file read loses its front;
+  - more than 10,000 events: the newest are kept.
+- A machine with no history gives no events and `complete: true`.
+- The read has 20 s and 4 MiB of output. Past either, the portal kills ssh and fails with `internal`. An SSH failure
+  is `ssh_failed`, with fixed text.
+- An older portal answers `invalid_args` for this command, and callers skip then, as for `event`.
 
 ## Agent requests
 
