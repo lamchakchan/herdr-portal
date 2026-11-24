@@ -49,6 +49,15 @@ const BODY_CAP: usize = (FILE_CAP + 1).div_ceil(3) * 4 + 4096;
 pub(crate) const PROGRESS_FAILED: &str = "The progress read on the machine failed.";
 pub(crate) const PROGRESS_SLOW: &str = "The progress read on the machine took too long.";
 pub(crate) const PROGRESS_TOO_BIG: &str = "The progress read on the machine printed too much.";
+/// The fixed texts a bounded read fails with: past its deadline, and past its output limit.
+pub(crate) struct ReadTexts {
+    pub(crate) slow: &'static str,
+    pub(crate) too_big: &'static str,
+}
+const PROGRESS_TEXTS: ReadTexts = ReadTexts {
+    slow: PROGRESS_SLOW,
+    too_big: PROGRESS_TOO_BIG,
+};
 
 /// Runs on the machine as `bash -s`. It prints one framed stream: `NOW\t<epoch s>`; per file `PROGRESS\t<name>` or
 /// `TEAM\t<dir>`, its first 256 KiB + 1 byte as base64 lines, then `END` (never a base64 line, whose length is a
@@ -170,7 +179,7 @@ fn is_lead_id(id: &str) -> bool {
 }
 
 /// Standard base64, padding optional and only at the end, white space ignored. None when it isn't base64.
-fn decode_base64(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
     let (mut acc, mut bits) = (0u32, 0u32);
     let mut padded = false;
@@ -434,21 +443,29 @@ pub(crate) fn remote_argv(machine: &Machine) -> Result<Vec<String>> {
 /// Runs `SCRIPT` on the machine: (exit code, stdout, stderr), within OUTPUT_CAP and DEADLINE.
 fn run_script(machine: &Machine) -> Result<(i32, String, String)> {
     if is_local(machine) {
-        return run_bounded(&["bash", "-s"], SCRIPT, OUTPUT_CAP, deadline());
+        return run_bounded(
+            &["bash", "-s"],
+            SCRIPT,
+            OUTPUT_CAP,
+            deadline(),
+            &PROGRESS_TEXTS,
+        );
     }
     ensure_master(&machine.target)?;
     let args = remote_argv(machine)?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_bounded(&refs, SCRIPT, OUTPUT_CAP, deadline())
+    run_bounded(&refs, SCRIPT, OUTPUT_CAP, deadline(), &PROGRESS_TEXTS)
 }
 
 /// DEADLINE, which a debug build lets tests shorten with `HERDR_PORTAL_PROGRESS_DEADLINE_MS`.
 fn deadline() -> Duration {
+    deadline_for("HERDR_PORTAL_PROGRESS_DEADLINE_MS")
+}
+
+/// DEADLINE, or in a debug build the milliseconds `var` names, so tests can shorten it. Release builds ignore `var`.
+pub(crate) fn deadline_for(var: &str) -> Duration {
     if cfg!(debug_assertions) {
-        if let Some(ms) = std::env::var("HERDR_PORTAL_PROGRESS_DEADLINE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
+        if let Some(ms) = std::env::var(var).ok().and_then(|v| v.parse::<u64>().ok()) {
             return Duration::from_millis(ms);
         }
     }
@@ -461,11 +478,12 @@ fn deadline() -> Duration {
 /// deadline, the group is killed then: usually that leftover is a member, which keeps the group id from being reused.
 /// A leftover that left the group (setsid) is not reached, and the read still ends at the deadline. stderr is kept up
 /// to 64 KiB.
-fn run_bounded(
+pub(crate) fn run_bounded(
     args: &[&str],
     input: &str,
     limit: usize,
     deadline: Duration,
+    texts: &ReadTexts,
 ) -> Result<(i32, String, String)> {
     use std::os::unix::process::CommandExt;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -529,24 +547,20 @@ fn run_bounded(
     let out = reader.join().unwrap_or_default();
     let err_text = String::from_utf8_lossy(&errors.join().unwrap_or_default()).into_owned();
     match status {
-        Some(_) if over.load(Ordering::SeqCst) => Err(err_with(
-            "internal",
-            PROGRESS_TOO_BIG,
-            "output over the limit",
-        )),
+        Some(_) if over.load(Ordering::SeqCst) => {
+            Err(err_with("internal", texts.too_big, "output over the limit"))
+        }
         Some(status) => Ok((
             status.code().unwrap_or(1),
             String::from_utf8_lossy(&out).into_owned(),
             err_text,
         )),
-        None if over.load(Ordering::SeqCst) => Err(err_with(
-            "internal",
-            PROGRESS_TOO_BIG,
-            "output over the limit",
-        )),
+        None if over.load(Ordering::SeqCst) => {
+            Err(err_with("internal", texts.too_big, "output over the limit"))
+        }
         None => Err(err_with(
             "internal",
-            PROGRESS_SLOW,
+            texts.slow,
             format!("no answer within {} s", deadline.as_secs()),
         )),
     }
@@ -836,8 +850,14 @@ mod tests {
         let pidfile = dir.join("pid");
         let script = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
         let start = Instant::now();
-        let e =
-            run_bounded(&["sh", "-c", &script], "", 1024, Duration::from_millis(500)).unwrap_err();
+        let e = run_bounded(
+            &["sh", "-c", &script],
+            "",
+            1024,
+            Duration::from_millis(500),
+            &PROGRESS_TEXTS,
+        )
+        .unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(api::json_message(&e), PROGRESS_SLOW);
         let pid: i32 = fs::read_to_string(&pidfile)
@@ -857,12 +877,24 @@ mod tests {
     #[test]
     fn a_read_past_its_size_limit_is_stopped() {
         let start = Instant::now();
-        let e =
-            run_bounded(&["sh", "-c", "yes"], "", 64 * 1024, Duration::from_secs(20)).unwrap_err();
+        let e = run_bounded(
+            &["sh", "-c", "yes"],
+            "",
+            64 * 1024,
+            Duration::from_secs(20),
+            &PROGRESS_TEXTS,
+        )
+        .unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(api::json_message(&e), PROGRESS_TOO_BIG);
-        let (code, out, _) =
-            run_bounded(&["sh", "-c", "cat"], "hello", 1024, Duration::from_secs(5)).unwrap();
+        let (code, out, _) = run_bounded(
+            &["sh", "-c", "cat"],
+            "hello",
+            1024,
+            Duration::from_secs(5),
+            &PROGRESS_TEXTS,
+        )
+        .unwrap();
         assert_eq!((code, out.as_str()), (0, "hello"));
     }
 

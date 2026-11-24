@@ -15,6 +15,7 @@ mod api;
 mod auto;
 mod event;
 mod history;
+mod history_read;
 mod picker;
 mod progress;
 mod requests;
@@ -155,6 +156,7 @@ fn run(mut args: Vec<String>, json_out: bool) -> Result<()> {
         "list" => api::cmd_list(&args[1..], json_out),
         "progress" => progress::cmd_progress(&args[1..], json_out),
         "event" => event::cmd_event(&args[1..], json_out),
+        "history" => history_read::cmd_history(&args[1..], json_out),
         "stop" => api::cmd_stop(&args[1..], json_out),
         "start" => api::cmd_start(&args[1..], json_out),
         "request" => requests::cmd_request(&args[1..], json_out),
@@ -194,6 +196,7 @@ fn print_help() {
   restore
   progress <Local|machine>   herdr-projects progress and Claude Code teams there
   event <kind> --work <id> …  append one work-history event here (see README: Work history)
+  history <Local|machine> [--since S]  that machine's work history (with --json)
 
 Agent requests (run in a Herdr pane on the machine where the service listens):
   request <port> [--local-port N | --any] [--pane ID] [--wait SECS]
