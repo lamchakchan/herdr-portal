@@ -3,7 +3,6 @@
 //! live in `config.toml` under `[auto]`; see "Auto-forward" in README.md.
 
 use super::*;
-use api::err;
 
 const MISSES_TO_STOP: u8 = 2;
 
@@ -80,8 +79,9 @@ impl AutoConfig {
     fn validate(&self) -> Result<()> {
         for rule in &self.ports {
             if rule.bounds().is_none() {
-                return Err(err(
+                return Err(api::err_with(
                     "invalid_args",
+                    "config.toml: an [auto] ports entry is not a port or \"low-high\" range.",
                     format!(
                         "[auto] ports: '{}' is not a port or \"low-high\" range",
                         match rule {
@@ -104,17 +104,25 @@ pub(crate) fn config_path() -> Result<PathBuf> {
                 .join(".config/herdr/plugins/config")
                 .join(PLUGIN_ID),
         }
-        .join("config.toml"),
+        .join(CONFIG_FILE),
     )
 }
+
+pub(crate) const CONFIG_FILE: &str = "config.toml";
 
 pub(crate) fn load_config() -> Result<AutoConfig> {
     let path = config_path()?;
     let Ok(text) = fs::read_to_string(&path) else {
         return Ok(AutoConfig::default());
     };
-    let file: ConfigFile = toml::from_str(&text)
-        .map_err(|e| err("invalid_args", format!("{}: {e}", path.display())))?;
+    // toml's error quotes the file; the path names the home folder. Both stay out of JSON.
+    let file: ConfigFile = toml::from_str(&text).map_err(|e| {
+        api::err_with(
+            "invalid_args",
+            "config.toml does not parse.",
+            format!("{}: {e}", path.display()),
+        )
+    })?;
     file.auto.validate()?;
     Ok(file.auto)
 }
