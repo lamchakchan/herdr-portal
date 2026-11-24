@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 mod api;
 mod auto;
 mod picker;
+mod progress;
 mod requests;
 mod sharing;
 
@@ -150,6 +151,7 @@ fn run(mut args: Vec<String>, json_out: bool) -> Result<()> {
         "pick" => picker::run(&args[1..]),
         "add" => api::cmd_add(&args[1..], json_out),
         "list" => api::cmd_list(&args[1..], json_out),
+        "progress" => progress::cmd_progress(&args[1..], json_out),
         "stop" => api::cmd_stop(&args[1..], json_out),
         "start" => api::cmd_start(&args[1..], json_out),
         "request" => requests::cmd_request(&args[1..], json_out),
@@ -187,6 +189,7 @@ fn print_help() {
   stop <local-port> [--keep]
   start <local-port>
   restore
+  progress <Local|machine>   herdr-projects progress and Claude Code teams there
 
 Agent requests (run in a Herdr pane on the machine where the service listens):
   request <port> [--local-port N | --any] [--pane ID] [--wait SECS]
@@ -196,7 +199,7 @@ Agent requests (run in a Herdr pane on the machine where the service listens):
                    on the laptop: open and close forwards that panes ask for
   start-watch      start watch in the background unless it already runs
 
-Add --json to scan, list, add, stop or start for one JSON object on stdout:
+Add --json to scan, list, add, stop, start or progress for one JSON object on stdout:
 {{\"ok\": true, ...}} on success, {{\"ok\": false, \"error\": {{\"code\", \"message\"}}}} on failure.
 
 Forwards outlive the picker. Herdr startup runs `watch --restore-first`.
