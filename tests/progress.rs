@@ -434,3 +434,158 @@ fn a_nested_lead_id_neither_hides_the_real_lead_nor_costs_another_team() {
         1
     );
 }
+
+const LEAD4: &str = "5a5b5c5d-0000-4000-8000-000000000005";
+
+#[test]
+fn a_stat_that_fails_leaves_the_list_incomplete() {
+    // `stat` answers for "/" (so the script picks it) and fails for every transcript; then it fails for everything.
+    for fake in [
+        "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\n[ \"$last\" = / ] && exec /usr/bin/stat \"$@\"\nexit 1\n",
+        "#!/bin/sh\nexit 1\n",
+    ] {
+        let fixture = Fixture::new("badstat");
+        write_exec(&fixture.dir.join("bin/stat"), fake);
+        let (ok, stdout, stderr) = fixture.run(&["progress", "devbox", "--json"]);
+        assert!(ok, "{stdout}{stderr}");
+        let doc: Value = serde_json::from_str(&stdout).unwrap();
+        let squad = team_of(&doc, "squad");
+        assert_eq!(squad["transcripts_complete"], false, "{squad}");
+    }
+}
+
+#[test]
+fn only_the_top_level_lead_id_is_read() {
+    let fixture = Fixture::new("toplevel");
+    let teams = fixture.dir.join("home/.claude/teams");
+    fs::create_dir_all(teams.join("deep")).unwrap();
+    let nested: Vec<String> = (0..5)
+        .map(|i| format!(r#"{{"name":"n{i}","x":{{"leadSessionId":"{NEST}"}}}}"#))
+        .collect();
+    fs::write(
+        teams.join("deep/config.json"),
+        format!(
+            r#"{{"members":[{}],"leadSessionId":"{LEAD4}"}}"#,
+            nested.join(",")
+        ),
+    )
+    .unwrap();
+    fs::write(
+        subagents(&fixture, LEAD4).join("agent-an0-0123456789abcdef.jsonl"),
+        "",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = fixture.run(&["progress", "devbox", "--json"]);
+    assert!(ok, "{stdout}{stderr}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let deep = team_of(&doc, "deep");
+    assert_eq!(deep["transcripts_complete"], true, "{deep}");
+    assert_eq!(deep["transcripts"].as_array().unwrap().len(), 1, "{deep}");
+}
+
+/// A fake ssh that runs `body` in place of the script (after the master checks pass).
+fn with_ssh(fixture: &Fixture, body: &str) {
+    write_exec(
+        &fixture.dir.join("bin/ssh"),
+        &format!("#!/bin/sh\ncase \" $* \" in *\" -O check \"*) echo 'Master running (pid=1)' >&2; exit 0 ;; *\" -N \"*) exit 0 ;; esac\n{body}\n"),
+    );
+}
+
+#[test]
+fn a_machine_that_floods_is_cut_off() {
+    let fixture = Fixture::new("flood");
+    with_ssh(&fixture, "cat >/dev/null; exec yes");
+    let start = std::time::Instant::now();
+    let (ok, stdout, _) = fixture.run(&["progress", "devbox", "--json"]);
+    assert!(!ok);
+    assert!(stdout.contains("printed too much"), "{stdout}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+}
+
+/// Runs `progress devbox --json` with the debug build's 1 s deadline.
+#[cfg(debug_assertions)]
+fn run_with_short_deadline(fixture: &Fixture) -> (bool, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-portal"))
+        .args(["progress", "devbox", "--json"])
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                fixture.dir.join("bin").display()
+            ),
+        )
+        .env("HOME", fixture.dir.join("home"))
+        .env("HERDR_BIN_PATH", fixture.dir.join("bin/herdr"))
+        .env("HERDR_PLUGIN_STATE_DIR", fixture.dir.join("state"))
+        .env("TMPDIR", fixture.dir.join("tmp"))
+        .env("HERDR_PORTAL_PROGRESS_DEADLINE_MS", "1000")
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[cfg(debug_assertions)]
+fn gone(pidfile: &std::path::Path) -> bool {
+    let pid: i32 = fs::read_to_string(pidfile).unwrap().trim().parse().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    !Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// Debug builds only: the deadline knob is ignored in release, where the read has its full 20 s.
+#[cfg(debug_assertions)]
+#[test]
+fn a_machine_that_hangs_or_leaves_its_output_open_is_cut_off_with_everything_it_started() {
+    for (name, body) in [
+        ("hang", "cat >/dev/null; sleep 60 & echo $! > '{pid}'; wait"),
+        // ssh exits at once, but what it left behind still holds stdout.
+        (
+            "linger",
+            "cat >/dev/null; sleep 60 & echo $! > '{pid}'; exit 0",
+        ),
+    ] {
+        let fixture = Fixture::new(name);
+        let pidfile = fixture.dir.join("sleep.pid");
+        with_ssh(
+            &fixture,
+            &body.replace("{pid}", &pidfile.display().to_string()),
+        );
+        let start = std::time::Instant::now();
+        let (ok, stdout) = run_with_short_deadline(&fixture);
+        assert!(!ok, "{name}");
+        assert!(stdout.contains("took too long"), "{name}: {stdout}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "{name}"
+        );
+        assert!(gone(&pidfile), "{name}: the fake ssh's sleep still runs");
+    }
+}
+
+#[test]
+fn a_transcript_name_that_could_forge_a_time_is_skipped_and_leaves_the_list_incomplete() {
+    let fixture = Fixture::new("forge");
+    // Printed whole by stat, this name would give agent-avictim a write time of 9999999999.5.
+    fs::write(
+        subagents(&fixture, LEAD)
+            .join("agent-ax\n9999999999.5\tagent-avictim-0123456789abcdef.jsonl"),
+        "",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = fixture.run(&["progress", "devbox", "--json"]);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("victim"), "{stdout}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let squad = team_of(&doc, "squad");
+    assert_eq!(squad["transcripts_complete"], false, "{squad}");
+    assert_eq!(
+        squad["transcripts"][0]["name"],
+        "agent-aimpl-x-0123456789abcdef.jsonl"
+    );
+}
