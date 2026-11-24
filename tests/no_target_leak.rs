@@ -6,7 +6,8 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const TARGET: &str = "someone@192.0.2.1";
 /// What a hostile or chatty ssh, or a failing remote command, might print.
@@ -18,7 +19,8 @@ struct Fake {
 
 impl Fake {
     /// `mode` steers the fake ssh: `down` (no master ever), `unreachable` (master up, the command exits 255),
-    /// `remote-fails` (master up, the command exits 1), `garbled` (`-O check` passes with unreadable output).
+    /// `remote-fails` (master up, the command exits 1), `garbled` (`-O check` passes with unreadable output),
+    /// `cancel-fails` (`-O cancel` fails while the master still owns the listener).
     fn new(name: &str, mode: &str) -> Fake {
         let dir = std::env::temp_dir().join(format!("hp-leak-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -33,7 +35,12 @@ case " $* " in
     case "{mode}" in
       down) echo "Control socket connect(/tmp/hpl-x): No such file or directory for {TARGET}" >&2; exit 255 ;;
       garbled) echo "mux_client_hello_exchange: {TARGET} /home/someone/.ssh" >&2; exit 0 ;;
+      cancel-fails) echo "Master running (pid=4242)" >&2; exit 0 ;;
       *) echo "Master running (pid=1)" >&2; exit 0 ;;
+    esac ;;
+  *" -O cancel "*)
+    case "{mode}" in
+      cancel-fails) echo "mux_client_forward: {TARGET} /home/someone cancel failed" >&2; exit 1 ;;
     esac ;;
   *" -N "*) exit 0 ;;
 esac
@@ -49,6 +56,11 @@ esac
         );
         write_exec(&dir.join("bin/ssh"), &ssh);
         write_exec(&dir.join("bin/herdr"), &herdr);
+        // The master (pid 4242 in `cancel-fails`) still listens on the forward's local port.
+        write_exec(
+            &dir.join("bin/lsof"),
+            "#!/bin/sh\necho 'ssh 4242 someone 5u IPv4 0x0 0t0 TCP 127.0.0.1:5173 (LISTEN)'\n",
+        );
         Fake { dir }
     }
 
@@ -86,27 +98,57 @@ esac
         self.run_env(args, &[])
     }
 
+    /// Like `run_status`, but a run still going after 10 s is killed and fails the test: a command that should refuse
+    /// `--json` at once must not start a loop or a picker.
+    fn run_quick(&self, args: &[&str]) -> (bool, String, String) {
+        let mut child = self
+            .command(args, &[])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if start.elapsed() > Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{args:?} still running after 10 s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
     fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String, String) {
+        let out = self.command(args, env).output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let path = format!(
             "{}:/usr/bin:/bin:/usr/sbin:/sbin",
             self.dir.join("bin").display()
         );
-        let out = Command::new(env!("CARGO_BIN_EXE_herdr-portal"))
-            .args(args)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_herdr-portal"));
+        cmd.args(args)
             .env("PATH", path)
             .env("HOME", &self.dir)
             .env("HERDR_BIN_PATH", self.dir.join("bin/herdr"))
             .env("HERDR_PLUGIN_STATE_DIR", self.dir.join("state"))
             .env("HERDR_PLUGIN_CONFIG_DIR", self.dir.join("cfg"))
             .env("HERDR_PANE_ID", "w1:p1")
-            .envs(env.iter().copied())
-            .output()
-            .unwrap();
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
+            .envs(env.iter().copied());
+        cmd
     }
 }
 
@@ -303,6 +345,42 @@ fn request_commands_hide_herdr_s_words() {
     ] {
         let (out, err) = fake.run(args);
         assert_eq!(error_code(&out), "herdr_failed", "{args:?}: {out}");
+        fake.assert_clean(&format!("{args:?}"), &out, &err);
+    }
+}
+
+#[test]
+fn stop_when_ssh_cannot_cancel_a_live_forward() {
+    let fake = Fake::new("cancel", "cancel-fails");
+    fake.forward();
+    let (ok, out, err) = fake.run_status(&["stop", "5173", "--json"]);
+    assert!(!ok);
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(doc["error"]["code"], "ssh_failed", "{out}");
+    assert_eq!(
+        doc["error"]["message"], "SSH could not stop the forward.",
+        "{out}"
+    );
+    fake.assert_clean("stop, cancel fails", &out, &err);
+}
+
+#[test]
+fn commands_without_json_output_reject_json() {
+    let fake = Fake::new("nojson", "unreachable");
+    fake.forward();
+    for args in [
+        &["restore", "--json"][..],
+        &["watch", "--json"][..],
+        &["watch", "--interval", "1000", "--json"][..],
+        &["pick", "--json"][..],
+        &["open-picker", "--json"][..],
+        &["from-url", "--json"][..],
+        &["help", "--json"][..],
+        &["--json"][..],
+    ] {
+        let (ok, out, err) = fake.run_quick(args);
+        assert!(!ok, "{args:?}: {out}");
+        assert_eq!(error_code(&out), "invalid_args", "{args:?}");
         fake.assert_clean(&format!("{args:?}"), &out, &err);
     }
 }

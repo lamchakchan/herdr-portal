@@ -257,7 +257,7 @@ CLI prints ssh's own words, so a person at the terminal can see why a connection
 | An ambiguous selector gave `internal` and quoted it. | `invalid_args`, fixed text. |
 | A `config.toml` that doesn't parse put its path and a snippet in `auto.error`. | "config.toml does not parse." (`invalid_args`). |
 | `watch --status` and `start-watch` gave absolute `log` and `config` paths. | File names, as above. |
-| `restore --json` ignored `--json`. | `invalid_args`: `restore` has no JSON output. |
+| `restore`, `pick`, `open-picker`, `from-url`, `help` and loop-mode `watch` ignored `--json`. | `invalid_args`: they have no JSON output. |
 
 ## Agent requests
 

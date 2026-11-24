@@ -974,6 +974,12 @@ pub(crate) fn cmd_watch(args: &[String], json_out: bool) -> Result<()> {
         print_actions(&pass);
         return Ok(());
     }
+    if json_out {
+        return Err(err(
+            "invalid_args",
+            "watch without --once or --status has no --json output.",
+        ));
+    }
     let interval = match args.flags.get("--interval") {
         Some(ms) => ms
             .parse::<u64>()

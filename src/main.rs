@@ -104,7 +104,36 @@ fn main() {
     }
 }
 
+/// Commands that print plain text only. With `--json` they fail with `invalid_args`, so a JSON caller never parses
+/// text or starts a picker. Loop-mode `watch` is refused in `cmd_watch`.
+const PLAIN_ONLY: [&str; 7] = [
+    "pick",
+    "restore",
+    "open-picker",
+    "from-url",
+    "help",
+    "--help",
+    "-h",
+];
+
 fn run(mut args: Vec<String>, json_out: bool) -> Result<()> {
+    if json_out {
+        if let Some(command) = PLAIN_ONLY
+            .iter()
+            .find(|c| args.first().map(String::as_str) == Some(**c))
+        {
+            return Err(api::err(
+                "invalid_args",
+                format!("{command} has no --json output."),
+            ));
+        }
+        if args.is_empty() {
+            return Err(api::err(
+                "invalid_args",
+                "Name a command; see herdr-portal help.",
+            ));
+        }
+    }
     if args.is_empty() {
         print_help();
         return Ok(());
@@ -128,10 +157,6 @@ fn run(mut args: Vec<String>, json_out: bool) -> Result<()> {
         "requests" => requests::cmd_requests(&args[1..], json_out),
         "watch" => requests::cmd_watch(&args[1..], json_out),
         "start-watch" => requests::cmd_start_watch(&args[1..], json_out),
-        "restore" if json_out => Err(api::err(
-            "invalid_args",
-            "restore has no --json output; use list --json --state inactive and start --json.",
-        )),
         "restore" => cmd_restore(),
         "open-picker" => cmd_open_picker(&args[1..]),
         "from-url" => cmd_from_url(),
