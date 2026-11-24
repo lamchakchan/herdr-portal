@@ -191,6 +191,7 @@ The API for agents and scripts is the CLI with `--json`. It doesn't run a server
 | All active forwards | `list --json --state active` |
 | All inactive forwards | `list --json --state inactive` |
 | Remote ports not forwarded | `scan <machine> --json --state available` |
+| Agent progress and teams | `progress <machine> --json` |
 | Open a forward | `add <machine> <port> [--local-port N] --json` |
 | Close a forward | `stop <local-port> --json` (add `--keep` to pause it instead) |
 | Resume a paused forward | `start <local-port> --json` |
@@ -258,6 +259,52 @@ CLI prints ssh's own words, so a person at the terminal can see why a connection
 | A `config.toml` that doesn't parse put its path and a snippet in `auto.error`. | "config.toml does not parse." (`invalid_args`). |
 | `watch --status` and `start-watch` gave absolute `log` and `config` paths. | File names, as above. |
 | `restore`, `pick`, `open-picker`, `from-url`, `help` and loop-mode `watch` ignored `--json`. | `invalid_args`: they have no JSON output. |
+
+## Agent progress
+
+`progress <machine> --json` reads two things on that machine: the herdr-projects progress records
+(`~/.herdr-projects/.progress/*.json`) and the Claude Code team configs (`~/.claude/teams/*/config.json`).
+`Local` reads this machine. It also stats each teammate's transcript without reading it. Headway uses this to show a
+remote agent's progress and teammates.
+
+```json
+{
+  "ok": true, "schema": 1,
+  "machine": "dell", "machine_id": "5b4e…",
+  "now": 1764000000,
+  "progress": [
+    {"file": "w3_p2-1a2b3c4d.json", "record": {"pane_id": "w3:p2", "terminal_id": "…", "percent": 55,
+      "activity": "…", "reported_at": 1763999900, "session_started_at": 1763990000}},
+    {"file": "w4_p1-9f8e7d6c.json", "error": "bad_json"}
+  ],
+  "teams": [
+    {"team": "squad", "config": {"leadSessionId": "…", "members": [{"name": "impl-x", "agentType": "…", "joinedAt": 1763990000000}]},
+     "transcripts": [{"name": "agent-aimpl-x-0123456789abcdef.jsonl", "mtime_ms": 1763999950000}],
+     "transcripts_complete": true}
+  ],
+  "truncated": false
+}
+```
+
+- `now` is the machine's own clock, in epoch seconds, so a caller can judge staleness without clock skew.
+- A record keeps only the six keys shown. A team keeps only `leadSessionId` and each member's `name`, `agentType` and
+  `joinedAt`. Every other key, a member's `prompt` first of all, is dropped before printing.
+- A kept value is a string or a number, as its key expects (`joinedAt` may be either), or it is dropped. Strings lose
+  control and format characters and are cut to 256 characters. Numbers pass unchanged, whatever their size or sign, so
+  a consumer must clamp them (a percent to 0–100, a time to a sane range).
+- `transcripts` lists the lead's teammate transcripts newest first, at most 1000 per lead. `transcripts_complete` is
+  false when that list was cut, or the lead's folder wasn't read: a teammate missing from it has an unknown state, not
+  "no transcript yet".
+- Nothing is logged or written.
+- An entry's `error` is `bad_json`, or `too_large` past 256 KiB.
+- A missing folder gives `[]`.
+- `truncated` is true when a cap stopped the read: 500 records, 100 teams, 1000 transcripts for one lead or 5000 in
+  all, or 1 MiB each of records and of team configs. A file past 256 KiB sends no content, only its name, and counts toward neither budget.
+- One fixed script runs per call, over the machine's SSH master. It interpolates nothing, and a lead id becomes part
+  of a path only once it matches `^[0-9a-f-]{36}$`.
+- The read has 20 s and 4 MiB of output. Past either, the portal kills ssh, or the local script, with everything it
+  started, and fails with `internal`.
+- An older portal answers `invalid_args` for this command.
 
 ## Agent requests
 
