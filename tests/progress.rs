@@ -73,6 +73,9 @@ impl Fixture {
             &format!("#!/bin/sh\necho '[{{\"id\":\"5b4e\",\"label\":\"devbox\",\"target\":\"{TARGET}\",\"session\":\"\",\"enabled\":true}}]'\n"),
         );
         fs::create_dir_all(dir.join("state")).unwrap();
+        // Read only on the machine: a script that writes a temp file fails here, loudly, on stderr.
+        fs::create_dir_all(dir.join("tmp")).unwrap();
+        fs::set_permissions(dir.join("tmp"), fs::Permissions::from_mode(0o500)).unwrap();
         Fixture { dir }
     }
 
@@ -89,6 +92,7 @@ impl Fixture {
             .env("HOME", self.dir.join("home"))
             .env("HERDR_BIN_PATH", self.dir.join("bin/herdr"))
             .env("HERDR_PLUGIN_STATE_DIR", self.dir.join("state"))
+            .env("TMPDIR", self.dir.join("tmp"))
             .output()
             .unwrap();
         (
@@ -101,6 +105,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        let _ = fs::set_permissions(self.dir.join("tmp"), fs::Permissions::from_mode(0o700));
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -110,9 +115,40 @@ fn write_exec(path: &Path, text: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Every file under `dir` with its size and modification time.
+fn tree(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let meta = e.metadata().unwrap();
+            if meta.is_dir() {
+                stack.push(e.path());
+            } else {
+                out.push((e.path(), meta.len(), meta.modified().unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 fn check(machine: &str, machine_id: &str, label: &str) {
     let fixture = Fixture::new(machine);
+    let before = (
+        tree(&fixture.dir.join("home")),
+        tree(&fixture.dir.join("tmp")),
+    );
     let (ok, stdout, stderr) = fixture.run(&["progress", machine, "--json"]);
+    // Read only: nothing written in HOME or TMPDIR.
+    assert_eq!(
+        (
+            tree(&fixture.dir.join("home")),
+            tree(&fixture.dir.join("tmp"))
+        ),
+        before
+    );
     assert!(ok, "{stdout}{stderr}");
     assert_eq!(stderr, "", "nothing on stderr");
     for s in NEVER {

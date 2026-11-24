@@ -34,7 +34,8 @@ pub(crate) const PROGRESS_FAILED: &str = "The progress read on the machine faile
 /// Runs on the machine as `bash -s`. It prints one framed stream: `NOW\t<epoch s>`; per file `PROGRESS\t<name>` or
 /// `TEAM\t<dir>`, its first 256 KiB + 1 byte as base64 lines, then `END` (never a base64 line, whose length is a
 /// multiple of 4); per teammate transcript `TRANSCRIPT\t<lead id>\t<name>\t<mtime s>`; and `CAP\t<what>` when a cap
-/// stopped it. A lead id reaches a path only after it matches `^[0-9a-f-]{36}$`. A missing folder prints nothing.
+/// stopped it. A lead id reaches a path only after it matches `^[0-9a-f-]{36}$`. A missing folder prints nothing. It
+/// writes nothing on the machine.
 pub(crate) const SCRIPT: &str = r#"
 set -u
 cap=262144
@@ -66,7 +67,7 @@ done
 n=0
 for f in "$HOME"/.claude/teams/*/config.json; do
   [ -f "$f" ] && head -c $((cap + 1)) "$f"
-done 2>/dev/null | grep -o '"leadSessionId"[[:space:]]*:[[:space:]]*"[0-9a-f-]*"' | sed 's/.*"\([0-9a-f-]*\)"$/\1/' | grep -E '^[0-9a-f-]{36}$' | sort -u > "${TMPDIR:-/tmp}/hp-leads.$$"
+done 2>/dev/null | grep -o '"leadSessionId"[[:space:]]*:[[:space:]]*"[0-9a-f-]*"' | sed 's/.*"\([0-9a-f-]*\)"$/\1/' | grep -E '^[0-9a-f-]{36}$' | sort -u |
 while read -r id; do
   for f in "$HOME"/.claude/projects/*/"$id"/subagents/agent-a*.jsonl; do
     [ -f "$f" ] || continue
@@ -74,8 +75,7 @@ while read -r id; do
     t=$(stat -c %.3Y "$f" 2>/dev/null || stat -f %Fm "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null) || continue
     printf 'TRANSCRIPT\t%s\t%s\t%s\n' "$id" "${f##*/}" "$t"
   done
-done < "${TMPDIR:-/tmp}/hp-leads.$$"
-rm -f "${TMPDIR:-/tmp}/hp-leads.$$"
+done
 "#;
 
 /// A base name the output may carry: plain characters only (no path, no control or separator characters).
