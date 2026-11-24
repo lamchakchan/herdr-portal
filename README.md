@@ -291,7 +291,8 @@ remote agent's progress and teammates.
 - Nothing is logged or written.
 - An entry's `error` is `bad_json`, or `too_large` past 256 KiB.
 - A missing folder gives `[]`.
-- `truncated` is true when a cap stopped the read: 500 records, 100 teams, 500 transcripts, or 2 MiB in all.
+- `truncated` is true when a cap stopped the read: 500 records, 100 teams, 500 transcripts, or 1 MiB each of records
+  and of team configs. A file past 256 KiB sends no content, only its name, and counts toward neither budget.
 - One fixed script runs per call, over the machine's SSH master. It interpolates nothing, and a lead id becomes part
   of a path only once it matches `^[0-9a-f-]{36}$`.
 - An older portal answers `invalid_args` for this command.
