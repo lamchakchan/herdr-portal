@@ -108,7 +108,7 @@ fn now() -> Result<u64> {
 }
 
 /// Plain digits with no sign, space or leading zero (but `0` itself), at most 10 of them.
-fn plain_number(text: &str) -> Option<u64> {
+pub(crate) fn plain_number(text: &str) -> Option<u64> {
     let digits = !text.is_empty() && text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit());
     if !digits || (text.len() > 1 && text.starts_with('0')) {
         return None;

@@ -163,8 +163,6 @@ pub(crate) fn validate(event: &Event) -> Result<(), &'static str> {
 }
 
 /// A line read back: at most LINE_CAP bytes, one JSON object with no unknown key, schema 1, and valid. None otherwise.
-// The `history` reader (the next PR) is its caller; until then only the tests read lines back.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_line(line: &str) -> Option<Event> {
     if line.len() + 1 > LINE_CAP {
         return None;
