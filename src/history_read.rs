@@ -10,6 +10,8 @@ use crate::history::{month_file, parse_line, Event};
 use crate::progress::{deadline_for, decode_base64, run_bounded, ReadTexts};
 use api::{err, err_with, parse_args, print_json};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const SCHEMA: u32 = 1;
@@ -31,7 +33,10 @@ const TEXTS: ReadTexts = ReadTexts {
 
 /// Prints `NOW`, then for each month file at or after the month `$1`, newest first: `FILE <name> <bytes> <cut>`, the
 /// file's bytes in base64, `END`. A file larger than what is left of the budget sends its newest bytes, cut=1, and
-/// ends the read with `CAP`. It reads herdr-portal's default state directory, and writes nothing.
+/// ends the read with `CAP`. A month-named entry that is a link or not a regular file (a FIFO, a directory) is never
+/// read and prints `SKIP`; a history directory that is a link prints `BAD` (1181). The files come from a glob, not
+/// `ls`, so no other name can stand for a month's. It reads herdr-portal's default state directory, and writes
+/// nothing.
 pub(crate) const SCRIPT: &str = r#"
 set -u
 export LC_ALL=C
@@ -40,23 +45,28 @@ m=${1-}
 case "$m" in [0-9][0-9][0-9][0-9]-[0-9][0-9]) ;; *) printf 'BAD\n'; exit 0 ;; esac
 printf 'NOW\t%s\n' "$(date +%s)"
 d="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/lamchakchan.herdr-portal/history"
+if [ -L "$d" ]; then printf 'BAD\n'; exit 0; fi
 [ -d "$d" ] || exit 0
 total=0
-for f in $(ls -1 "$d" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}\.jsonl$' | sort -r); do
+files=("$d"/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl)
+for ((i = ${#files[@]} - 1; i >= 0; i--)); do
+  p=${files[i]}
+  f=${p##*/}
+  [ -e "$p" ] || [ -L "$p" ] || continue
   [[ "${f%.jsonl}" < "$m" ]] && break
-  [ -f "$d/$f" ] || continue
-  size=$(wc -c < "$d/$f" 2>/dev/null | tr -cd '0-9')
+  if [ ! -f "$p" ] || [ -L "$p" ]; then printf 'SKIP\n'; continue; fi
+  size=$(wc -c < "$p" 2>/dev/null | tr -cd '0-9')
   size=${size:-0}
   left=$((budget - total))
   if [ "$left" -le 0 ]; then printf 'CAP\tbytes\n'; break; fi
   if [ "$size" -gt "$left" ]; then
     printf 'FILE\t%s\t%s\t1\n' "$f" "$left"
-    tail -c "$left" "$d/$f" 2>/dev/null | base64
+    tail -c "$left" "$p" 2>/dev/null | base64
     printf 'END\nCAP\tbytes\n'
     break
   fi
   printf 'FILE\t%s\t%s\t0\n' "$f" "$size"
-  head -c "$size" "$d/$f" 2>/dev/null | base64
+  head -c "$size" "$p" 2>/dev/null | base64
   printf 'END\n'
   total=$((total + size))
 done
@@ -74,6 +84,8 @@ struct Found {
     /// Newest month first.
     chunks: Vec<Chunk>,
     capped: bool,
+    /// A month-named entry that wasn't a plain file (a FIFO, a directory, a link) was left unread.
+    skipped: bool,
 }
 
 fn is_month_file(name: &str) -> bool {
@@ -98,31 +110,65 @@ fn read_local(since: u64) -> Result<Found> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| err("internal", "The clock is before 1970."))?
         .as_secs();
-    let dir = state_dir()?.join("history");
+    let mut out = read_files(
+        &state_dir()?.join("history"),
+        &format!("{}.jsonl", first_month(since)),
+        READ_CAP,
+    )?;
+    out.now = now;
+    Ok(out)
+}
+
+/// The month files in `dir` from `first` on, newest first, within `cap` bytes. A missing `dir` is empty; a `dir`
+/// that is a link or not a directory is refused, as the writer refuses it (1181).
+///
+/// Each file is opened without following a link and without blocking, then must be a regular file: a FIFO, a
+/// directory or a link is skipped and the read is incomplete. Reading a FIFO would wait for a writer forever.
+fn read_files(dir: &Path, first: &str, cap: usize) -> Result<Found> {
     let mut out = Found {
-        now,
+        now: 0,
         chunks: Vec::new(),
         capped: false,
+        skipped: false,
     };
-    let Ok(entries) = fs::read_dir(&dir) else {
+    match fs::symlink_metadata(dir) {
+        Err(_) => return Ok(out),
+        Ok(meta) if !meta.file_type().is_dir() => {
+            return Err(err_with(
+                "internal",
+                HISTORY_FAILED,
+                "history is not a plain directory",
+            ))
+        }
+        Ok(_) => {}
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
         return Ok(out);
     };
-    let first = format!("{}.jsonl", first_month(since));
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .filter(|n| is_month_file(n) && *n >= first)
+        .filter(|n| is_month_file(n) && n.as_str() >= first)
         .collect();
     names.sort_unstable_by(|a, b| b.cmp(a));
-    let mut left = READ_CAP;
+    let mut left = cap;
     for name in names {
         if left == 0 {
             out.capped = true;
             break;
         }
-        let Ok(mut file) = fs::File::open(dir.join(&name)) else {
+        let opened = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(dir.join(&name));
+        let Some((mut file, size)) = opened.ok().and_then(|f| {
+            let meta = f.metadata().ok()?;
+            meta.file_type()
+                .is_file()
+                .then_some((f, meta.len() as usize))
+        }) else {
+            out.skipped = true;
             continue;
         };
-        let size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
         let cut = size > left;
         let take = size.min(left);
         if cut {
@@ -185,6 +231,7 @@ fn parse_stream(text: &str) -> Result<Found> {
         now: 0,
         chunks: Vec::new(),
         capped: false,
+        skipped: false,
     };
     let mut saw_now = false;
     while let Some(line) = lines.next() {
@@ -210,6 +257,7 @@ fn parse_stream(text: &str) -> Result<Found> {
                 });
             }
             ["CAP", "bytes"] => out.capped = true,
+            ["SKIP"] => out.skipped = true,
             _ => return Err(bad()),
         }
     }
@@ -221,7 +269,7 @@ fn parse_stream(text: &str) -> Result<Found> {
 
 /// The events at or after `since`, oldest first, the newest EVENT_CAP of them, and whether nothing was lost.
 fn events_of(read: Found, since: u64) -> (Vec<Event>, bool) {
-    let mut complete = !read.capped;
+    let mut complete = !read.capped && !read.skipped;
     let mut events = Vec::new();
     for chunk in &read.chunks {
         // A byte that isn't UTF-8 becomes U+FFFD, which no field's pattern takes, so its line is dropped below.
@@ -386,6 +434,7 @@ mod tests {
                 now: 0,
                 chunks: vec![Chunk { bytes, cut: true }],
                 capped: false,
+                skipped: false,
             },
             0,
         );
@@ -402,6 +451,7 @@ mod tests {
                     cut: false,
                 }],
                 capped: true,
+                skipped: false,
             },
             0,
         );
@@ -416,6 +466,7 @@ mod tests {
                 cut: false,
             }],
             capped: false,
+            skipped: false,
         }
     }
 
@@ -460,5 +511,72 @@ mod tests {
             ["q-a", "q-c"]
         );
         assert!(!complete);
+    }
+
+    /// A fresh empty directory for one test.
+    fn temp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("hp-hr-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// SCRIPT's output for `month`, its budget set to `budget`, run with `home` as HOME.
+    fn script_output(home: &std::path::Path, month: &str, budget: usize) -> String {
+        let script = SCRIPT.replace(
+            &format!("budget={READ_CAP}\n"),
+            &format!("budget={budget}\n"),
+        );
+        assert_ne!(script, SCRIPT, "the script's budget is READ_CAP");
+        let out = Command::new("bash")
+            .args(["-s", "--", month])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                c.stdin.take().unwrap().write_all(script.as_bytes())?;
+                c.wait_with_output()
+            })
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn history_under(home: &std::path::Path) -> std::path::PathBuf {
+        let d = home.join(".local/state/herdr/plugins/lamchakchan.herdr-portal/history");
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_budget_filled_exactly_by_the_newest_file_caps_the_read_locally() {
+        let d = temp("exact-local");
+        fs::write(d.join("2026-11.jsonl"), "0123456789").unwrap();
+        fs::write(d.join("2026-10.jsonl"), "abcde").unwrap();
+        let found = read_files(&d, "2026-01.jsonl", 10).unwrap();
+        assert_eq!(found.chunks.len(), 1);
+        assert!(!found.chunks[0].cut, "a file that fits exactly is whole");
+        assert!(found.capped, "a file left unread is a cap");
+        // With room for both, nothing is capped.
+        let found = read_files(&d, "2026-01.jsonl", 15).unwrap();
+        assert_eq!((found.chunks.len(), found.capped), (2, false));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_budget_filled_exactly_by_the_newest_file_caps_the_script() {
+        let home = temp("exact-script");
+        let d = history_under(&home);
+        fs::write(d.join("2026-11.jsonl"), "0123456789").unwrap();
+        fs::write(d.join("2026-10.jsonl"), "abcde").unwrap();
+        let found = parse_stream(&script_output(&home, "2026-01", 10)).unwrap();
+        assert_eq!(found.chunks.len(), 1);
+        assert!(!found.chunks[0].cut);
+        assert!(found.capped);
+        let found = parse_stream(&script_output(&home, "2026-01", 15)).unwrap();
+        assert_eq!((found.chunks.len(), found.capped), (2, false));
+        fs::remove_dir_all(&home).unwrap();
     }
 }

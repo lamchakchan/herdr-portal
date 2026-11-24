@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-portal");
@@ -72,10 +72,28 @@ impl Fixture {
         for (k, v) in extra {
             c.env(k, v);
         }
-        let out = c.output().unwrap();
-        let doc = serde_json::from_slice(&out.stdout)
-            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
-        (out.status.success(), doc)
+        // A read that hangs fails the test instead of hanging it, and its process is killed.
+        let mut child = c.stdout(Stdio::piped()).spawn().unwrap();
+        // Drained as it comes, so a large answer never fills the pipe while the loop waits.
+        let mut pipe = child.stdout.take().unwrap();
+        let drain = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut pipe, &mut out).map(|_| out)
+        });
+        let start = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if start.elapsed() > std::time::Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("history {args:?} hung");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let status = child.wait().unwrap();
+        let stdout = drain.join().unwrap().unwrap();
+        let doc = serde_json::from_slice(&stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&stdout)));
+        (status.success(), doc)
     }
 
     fn history(&self) -> PathBuf {
@@ -994,4 +1012,69 @@ fn a_clock_outside_2020_to_2100_is_internal_and_writes_nothing() {
         assert_eq!(doc["error"]["code"], "internal", "{at}: {doc}");
     }
     assert_eq!(fixture.lines(), Vec::<String>::new());
+}
+
+#[test]
+fn a_fifo_a_directory_or_a_link_in_history_is_skipped_and_clears_complete() {
+    use std::os::unix::fs::symlink;
+    for (name, remote) in [("odd-local", false), ("odd-remote", true)] {
+        let fixture = Fixture::new(name);
+        let dir = if remote {
+            fixture.remote_history()
+        } else {
+            fixture.history()
+        };
+        let t = now();
+        // The month files around now: the real one, then a FIFO, a directory and a link a month or more before it.
+        put(&dir, t, &fix_line("q-real", t - 60, 1));
+        let older = |days: u64| dir.join(month_of(t - days * DAY));
+        assert!(Command::new("mkfifo")
+            .arg(older(32))
+            .status()
+            .unwrap()
+            .success());
+        fs::create_dir(older(63)).unwrap();
+        let outside = fixture.dir.join("outside.jsonl");
+        fs::write(&outside, fix_line("q-outside", t - 120, 1)).unwrap();
+        symlink(&outside, older(94)).unwrap();
+        // A name holding a newline must not make the real month read twice.
+        fs::write(dir.join(format!("x\n{}", month_of(t))), "").unwrap();
+        let machine = if remote { "devbox" } else { "Local" };
+        let since = (t - 100 * DAY).to_string();
+        let (ok, doc) = fixture.read(&[machine, "--since", &since], &[]);
+        assert!(ok, "{name}: {doc}");
+        assert_eq!(rounds(&doc), [("q-real".to_string(), 1)], "{name}: {doc}");
+        assert_eq!(doc["complete"], false, "{name}: {doc}");
+    }
+}
+
+#[test]
+fn a_history_directory_that_is_a_link_is_refused() {
+    use std::os::unix::fs::symlink;
+    for (name, remote) in [("dirlink-local", false), ("dirlink-remote", true)] {
+        let fixture = Fixture::new(name);
+        let dir = if remote {
+            fixture.remote_history()
+        } else {
+            fixture.history()
+        };
+        let elsewhere = fixture.dir.join("elsewhere");
+        put(&elsewhere, now(), &fix_line("q-elsewhere", now() - 60, 1));
+        fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        symlink(&elsewhere, &dir).unwrap();
+        let (ok, doc) = fixture.read(&[if remote { "devbox" } else { "Local" }], &[]);
+        assert!(!ok, "{name}: {doc}");
+        assert_eq!(doc["error"]["code"], "internal", "{name}: {doc}");
+        assert!(!doc.to_string().contains("q-elsewhere"), "{name}: {doc}");
+    }
+}
+
+/// What callers rely on to skip an old portal: a command it doesn't know is `invalid_args`, as `history` is to one.
+#[test]
+fn an_unknown_command_is_invalid_args_as_history_is_on_an_older_portal() {
+    let fixture = Fixture::new("old-portal");
+    let out = fixture.run(&["histories", "Local", "--json"]);
+    assert!(!out.status.success());
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["error"]["code"], "invalid_args", "{doc}");
 }

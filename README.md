@@ -392,14 +392,20 @@ there.
 
 - `since` defaults to 7 days before now and may be at most 400 days back. It is plain digits, like an event's
   numbers. Anything else fails with `invalid_args`.
-- `machine` is the label the caller passed, never the SSH target. A line holds no machine of its own.
+- `machine` is the machine's label, as the caller passed it, never the SSH target. A line holds no machine of its
+  own.
 - `now` is the read machine's clock, in epoch seconds.
 - The read starts at the month of `since` minus one day, so a clock a little behind still finds its lines.
 - **`complete` is false** when anything was left out:
   - a line that isn't a valid schema 1 event, from a newer writer or a damaged file, is dropped;
   - two lines merged by a cut write are dropped, and the lines after them are still read;
   - more than 2 MiB of files: the newest months are read first, and the oldest file read loses its front;
-  - more than 10,000 events: the newest are kept.
+  - more than 10,000 events: the newest are kept;
+  - a month-named entry that is a link, a FIFO, a directory or anything but a regular file is never read.
+- A `history` directory that is a link fails with `internal`, as it does for `event`.
+- Over SSH, the script reads the default state directory only. It doesn't see `HERDR_PLUGIN_STATE_DIR`, which herdr
+  sets only for its own plugin runs, so a machine whose herdr uses another state directory reads as having no history.
+  `progress` has the same limit.
 - A machine with no history gives no events and `complete: true`.
 - The read has 20 s and 4 MiB of output. Past either, the portal kills ssh and fails with `internal`. An SSH failure
   is `ssh_failed`, with fixed text.
