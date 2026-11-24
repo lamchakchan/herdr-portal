@@ -3,7 +3,7 @@
 //! answers in `portal_st_<port>` on the same pane. See "Agent requests" in README.md.
 
 use super::*;
-use api::{err, parse_args, parse_port, print_json};
+use api::{err, err_with, parse_args, parse_port, print_json};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REQ_SOURCE: &str = "herdr-portal";
@@ -222,12 +222,12 @@ fn report_metadata(
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_on(machine, &refs, None)?;
     if code != 0 {
-        let detail = if stderr.trim().is_empty() {
-            stdout
+        let detail = said(&stdout, &stderr);
+        return Err(if is_local(machine) {
+            err_with("herdr_failed", HERDR_FAILED, detail)
         } else {
-            stderr
-        };
-        return Err(err("herdr_failed", detail.trim().to_string()));
+            remote_failure(code, "herdr_failed", HERDR_FAILED, detail)
+        });
     }
     Ok(())
 }

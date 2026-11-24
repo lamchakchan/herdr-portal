@@ -226,6 +226,10 @@ matched by directory, and `list` reports only the `pane_id` that `add` saved.
 null for a port that isn't saved. Asking `add` for a forward that is already active
 returns it unchanged.
 
+With `--json`, an error's `message` is fixed text for SSH and remote-command failures. It never quotes the SSH
+target, or ssh's or a remote command's stderr, which can name the user, the host or a home path. Without `--json`, the
+CLI prints ssh's own words, so a person at the terminal can see why a connection failed.
+
 | Error code | When |
 | --- | --- |
 | `invalid_args` | Unknown command, flag or port. |
@@ -233,7 +237,7 @@ returns it unchanged.
 | `local_port_in_use` | Another process holds the local port; retry with `--local-port`. |
 | `no_forward` | No tracked forward on that local port. |
 | `not_inactive` | `start` on a forward that is already active. |
-| `ssh_failed` | An SSH control command failed. |
+| `ssh_failed` | SSH could not connect, log in, or open or stop a forward. |
 | `herdr_failed` | `herdr` on the target machine failed or wasn't found. |
 | `internal` | Anything else. |
 

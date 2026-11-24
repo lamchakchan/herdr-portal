@@ -3,15 +3,19 @@
 
 use super::*;
 
+/// `message` is what `--json` prints. `detail`, when set, is what a person at the plain CLI sees instead: ssh's or a
+/// remote command's own words, which can name the SSH target, the user or a home path, so they never reach the JSON
+/// that Headway and agents read.
 #[derive(Debug)]
 pub(crate) struct ApiError {
     pub code: &'static str,
     pub message: String,
+    pub detail: Option<String>,
 }
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(self.detail.as_deref().unwrap_or(&self.message))
     }
 }
 
@@ -21,15 +25,34 @@ pub(crate) fn err(code: &'static str, message: impl Into<String>) -> anyhow::Err
     anyhow::Error::new(ApiError {
         code,
         message: message.into(),
+        detail: None,
+    })
+}
+
+/// An error whose JSON message is the fixed `message`, while the plain CLI shows `detail`.
+pub(crate) fn err_with(
+    code: &'static str,
+    message: &str,
+    detail: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(ApiError {
+        code,
+        message: message.into(),
+        detail: Some(detail.into()),
     })
 }
 
 pub(crate) fn error_json(error: &anyhow::Error) -> Value {
-    let code = error
+    let api = error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<ApiError>())
-        .map_or("internal", |api| api.code);
-    json!({"ok": false, "error": {"code": code, "message": format!("{error:#}")}})
+        .find_map(|cause| cause.downcast_ref::<ApiError>());
+    let code = api.map_or("internal", |api| api.code);
+    // An ApiError's own message, never its detail (or the chain's Display, which shows the detail).
+    let message = match api {
+        Some(api) if api.detail.is_some() => api.message.clone(),
+        _ => format!("{error:#}"),
+    };
+    json!({"ok": false, "error": {"code": code, "message": message}})
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -454,6 +477,21 @@ mod tests {
         assert_eq!(coded["error"]["code"], json!("no_forward"));
         let plain = error_json(&anyhow!("boom"));
         assert_eq!(plain["error"]["code"], json!("internal"));
+    }
+
+    #[test]
+    fn error_json_prints_the_fixed_message_and_never_the_detail() {
+        let error = err_with(
+            "ssh_failed",
+            SSH_UNREACHABLE,
+            "ssh: connect to host someone@192.0.2.1 port 22",
+        );
+        let out = error_json(&error);
+        assert_eq!(out["error"]["code"], json!("ssh_failed"));
+        assert_eq!(out["error"]["message"], json!(SSH_UNREACHABLE));
+        assert!(!out.to_string().contains("192.0.2.1"));
+        // The plain CLI prints the error's Display: the detail, for the person at the terminal.
+        assert!(format!("{error:#}").contains("someone@192.0.2.1"));
     }
 
     #[test]

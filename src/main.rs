@@ -449,6 +449,40 @@ fn hex_digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The fixed `--json` message for each SSH or remote-command failure (see `api::err_with`).
+pub(crate) const SSH_UNREACHABLE: &str = "Could not reach the machine over SSH.";
+pub(crate) const SSH_MASTER_FAILED: &str = "The SSH connection to the machine did not start.";
+pub(crate) const SSH_FORWARD_FAILED: &str = "SSH could not open the forward.";
+pub(crate) const SSH_STOP_FAILED: &str = "SSH could not stop the forward.";
+pub(crate) const HERDR_FAILED: &str = "herdr on the machine failed.";
+pub(crate) const LISTENERS_FAILED: &str = "Could not list the listening ports.";
+pub(crate) const MASTER_UNREADABLE: &str = "Could not read the SSH master's process.";
+
+/// A failed command run over SSH: exit 255 is ssh's own (it could not connect or log in), any other code the remote
+/// command's. The plain CLI keeps `detail`; JSON gets only the fixed message.
+pub(crate) fn remote_failure(
+    code: i32,
+    otherwise: &'static str,
+    message: &str,
+    detail: impl Into<String>,
+) -> anyhow::Error {
+    if code == 255 {
+        api::err_with("ssh_failed", SSH_UNREACHABLE, detail)
+    } else {
+        api::err_with(otherwise, message, detail)
+    }
+}
+
+/// ssh's or a command's stderr, else its stdout: what a person at the plain CLI sees.
+fn said(stdout: &str, stderr: &str) -> String {
+    if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    }
+    .to_string()
+}
+
 fn ssh_base(target: &str) -> Result<Vec<String>> {
     Ok(vec![
         "ssh".into(),
@@ -475,7 +509,11 @@ fn ensure_master(target: &str) -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    bail!("ssh master did not start for {target}");
+    Err(api::err_with(
+        "ssh_failed",
+        SSH_MASTER_FAILED,
+        format!("ssh master did not start for {target}"),
+    ))
 }
 
 fn master_alive(target: &str) -> Result<bool> {
@@ -565,12 +603,12 @@ fn herdr_result(machine: &Machine, args: &[&str]) -> Result<Value> {
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_on(machine, &refs, None)?;
     if code != 0 {
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
+        let detail = said(&stdout, &stderr);
+        return Err(if is_local(machine) {
+            api::err_with("herdr_failed", HERDR_FAILED, detail)
         } else {
-            stderr.trim()
-        };
-        return Err(api::err("herdr_failed", detail.to_string()));
+            remote_failure(code, "herdr_failed", HERDR_FAILED, detail)
+        });
     }
     let payload = parse_json_blob(&stdout)?;
     Ok(payload.get("result").cloned().unwrap_or(payload))
@@ -584,7 +622,7 @@ fn scan_listeners(machine: &Machine) -> Result<Vec<Listener>> {
             run_cmd(&["ss", "-ltnpH"], None)?
         };
         if code != 0 {
-            bail!(stderr.trim().to_string());
+            return Err(api::err_with("internal", LISTENERS_FAILED, stderr.trim()));
         }
         return Ok(parse_listeners(&stdout));
     }
@@ -605,7 +643,12 @@ fi
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_cmd(&refs, Some(script))?;
     if code != 0 {
-        bail!(stderr.trim().to_string());
+        return Err(remote_failure(
+            code,
+            "internal",
+            LISTENERS_FAILED,
+            stderr.trim(),
+        ));
     }
     Ok(parse_listeners(&stdout))
 }
@@ -874,7 +917,13 @@ fn forward_alive(forward: &Forward) -> Result<bool> {
         .split_once("Master running (pid=")
         .and_then(|(_, rest)| rest.split_once(')'))
         .and_then(|(pid, _)| pid.parse::<u32>().ok())
-        .ok_or_else(|| anyhow!("Cannot read SSH master PID: {}", stderr.trim()))?;
+        .ok_or_else(|| {
+            api::err_with(
+                "internal",
+                MASTER_UNREADABLE,
+                format!("Cannot read SSH master PID: {}", stderr.trim()),
+            )
+        })?;
     // A busy port alone is insufficient: it must belong to this SSH master.
     let listeners = if which("lsof") {
         let (code, stdout, stderr) = run_cmd(
@@ -890,13 +939,21 @@ fn forward_alive(forward: &Forward) -> Result<bool> {
             None,
         )?;
         if code != 0 && !(code == 1 && stdout.is_empty() && stderr.is_empty()) {
-            bail!("Cannot inspect SSH listeners: {}", stderr.trim());
+            return Err(api::err_with(
+                "internal",
+                LISTENERS_FAILED,
+                format!("Cannot inspect SSH listeners: {}", stderr.trim()),
+            ));
         }
         parse_lsof(&stdout)
     } else {
         let (code, stdout, stderr) = run_cmd(&["ss", "-ltnpH"], None)?;
         if code != 0 {
-            bail!("Cannot inspect SSH listeners: {}", stderr.trim());
+            return Err(api::err_with(
+                "internal",
+                LISTENERS_FAILED,
+                format!("Cannot inspect SSH listeners: {}", stderr.trim()),
+            ));
         }
         parse_ss(&stdout)
     };
@@ -994,7 +1051,11 @@ fn add_forward(
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, _, stderr) = run_cmd(&refs, None)?;
     if code != 0 {
-        return Err(api::err("ssh_failed", stderr.trim().to_string()));
+        return Err(api::err_with(
+            "ssh_failed",
+            SSH_FORWARD_FAILED,
+            stderr.trim(),
+        ));
     }
     let mut items = load_forwards()?;
     items.retain(|item| !(item.target == machine.target && item.local_port == local_port));
@@ -1038,8 +1099,9 @@ fn stop_forward(local_port: u16, keep: bool) -> Result<Forward> {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (code, _, stderr) = run_cmd(&refs, None)?;
         if code != 0 && forward_alive(&matched)? {
-            return Err(api::err(
+            return Err(api::err_with(
                 "ssh_failed",
+                SSH_STOP_FAILED,
                 format!("Cannot stop forward: {}", stderr.trim()),
             ));
         }
@@ -1169,7 +1231,11 @@ fn restore_one(item: &Forward) -> Result<()> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, _, stderr) = run_cmd(&refs, None)?;
     if code != 0 {
-        return Err(api::err("ssh_failed", stderr.trim().to_string()));
+        return Err(api::err_with(
+            "ssh_failed",
+            SSH_FORWARD_FAILED,
+            stderr.trim(),
+        ));
     }
     Ok(())
 }
