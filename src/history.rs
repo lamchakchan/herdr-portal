@@ -246,13 +246,14 @@ fn re(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
     cell.get_or_init(|| Regex::new(pattern).expect("a fixed pattern"))
 }
 
-/// A work id: a Jira key, `repo:branch` (`/` only between branch segments, none of them `.`, `..` or starting with
+/// A work id, every form bounded so none can carry a long run of words (1176): a Jira key (a project key of at most
+/// 10), `repo:branch` (`/` only between branch segments, none of them `.`, `..` or starting with
 /// `-`), or a tracker id (lower case, may start with a digit: ruling 1174).
 fn work_id(id: &str) -> bool {
     static JIRA: OnceLock<Regex> = OnceLock::new();
     static BRANCH: OnceLock<Regex> = OnceLock::new();
     static TRACKER: OnceLock<Regex> = OnceLock::new();
-    if re(&JIRA, r"\A[A-Z][A-Z0-9]*-[1-9][0-9]{0,8}\z").is_match(id) {
+    if re(&JIRA, r"\A[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,8}\z").is_match(id) {
         return true;
     }
     if id.len() <= 64 && re(&TRACKER, r"\A[a-z0-9]+(?:-[a-z0-9]+)*\z").is_match(id) {
@@ -402,6 +403,8 @@ mod tests {
         ("work", "AT-1234567890", false),
         ("work", "AT-", false),
         ("work", "xAT-1", false),
+        ("work", "ABCDEFGHIJ-1", true),
+        ("work", "ABCDEFGHIJK-1", false),
         ("work", "AT-1x", false),
         ("work", "herdr-portal:main", true),
         ("work", "herdr-portal:feat/history-event", true),
@@ -558,6 +561,15 @@ mod tests {
             validate(&with("work", &format!("{long_branch}b"))),
             Err("work")
         );
+        // A Jira-shaped id of 129 bytes, and one of 3,000: the key is bounded, so neither is free text (1176).
+        assert_eq!(
+            validate(&with("work", &format!("{}-1", "A".repeat(127)))),
+            Err("work")
+        );
+        assert_eq!(
+            validate(&with("work", &format!("{}-1", "A".repeat(3000)))),
+            Err("work")
+        );
         // Numbers.
         let mut fix = Event::new(Kind::Fix, AT, "AT-1");
         for (round, ok) in [(0, false), (1, true), (1000, true), (1001, false)] {
@@ -658,6 +670,12 @@ mod tests {
         ] {
             assert_eq!(parse_line(&bad), None, "{bad}");
         }
+        // The cap is exact: 1,023 bytes plus the newline is a whole line; one more byte is not (1176).
+        let pad = |n: usize| good.replacen('{', &format!("{{{}", " ".repeat(n)), 1);
+        let fits = pad(LINE_CAP - 1 - good.len());
+        assert_eq!(fits.len() + 1, LINE_CAP);
+        assert!(parse_line(&fits).is_some());
+        assert_eq!(parse_line(&pad(LINE_CAP - good.len())), None);
         // Past the cap, even when valid JSON with only known keys (white space padding).
         let padded = good.replacen('{', &format!("{{{}", " ".repeat(LINE_CAP)), 1);
         assert_eq!(parse_line(&padded), None);
