@@ -304,6 +304,25 @@ fn a_bad_event_writes_nothing_and_never_echoes_its_value() {
             "done",
             "--prompt=ZZ-SECRET words",
         ],
+        // 1178: an unknown flag whose name is not a plain name is not echoed at all.
+        vec![
+            "event",
+            "end",
+            "--work",
+            "AT-1",
+            "--outcome",
+            "done",
+            "--prompt ZZ-SECRET words",
+        ],
+        vec![
+            "event",
+            "end",
+            "--work",
+            "AT-1",
+            "--outcome",
+            "done",
+            "--prompt:ZZ-SECRET",
+        ],
         vec![
             "event",
             "end",
@@ -416,6 +435,20 @@ fn a_month_file_that_is_a_link_a_fifo_or_loose_is_refused_or_tightened() {
     fs::write(&outside, "keep\n").unwrap();
     fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
     symlink(&outside, fixture.history().join(&month)).unwrap();
+    let out = fixture.run(&end);
+    assert!(!out.status.success());
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["error"]["code"], "internal", "{doc}");
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "keep\n");
+    assert_eq!(mode(&outside), 0o644);
+
+    // A hard link to a file elsewhere (1178): refused, and the target untouched.
+    let fixture = Fixture::new("hardlink");
+    fs::create_dir_all(fixture.history()).unwrap();
+    let outside = fixture.dir.join("outside.txt");
+    fs::write(&outside, "keep\n").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::hard_link(&outside, fixture.history().join(&month)).unwrap();
     let out = fixture.run(&end);
     assert!(!out.status.success());
     let doc: Value = serde_json::from_slice(&out.stdout).unwrap();

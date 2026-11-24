@@ -149,15 +149,31 @@ pub(crate) fn parse_args(
             out.switches.insert(name);
             i += 1;
         } else if arg.starts_with("--") {
-            // Only the flag's name: `--flag=value` may carry anything after the `=` (1176).
+            // Only the flag's name: `--flag=value` may carry anything after the `=` (1176), and an argument that is
+            // not a plain `--name` may carry anything at all (1178).
             let flag = arg.split('=').next().unwrap_or(arg);
-            return Err(err("invalid_args", format!("unknown argument {flag}")));
+            return Err(err(
+                "invalid_args",
+                if plain_flag(flag) {
+                    format!("unknown argument {flag}")
+                } else {
+                    "unknown argument".to_string()
+                },
+            ));
         } else {
             out.positional.push(arg.to_string());
             i += 1;
         }
     }
     Ok(out)
+}
+
+/// `--[a-z][a-z-]*`: a flag name that is safe to print.
+fn plain_flag(flag: &str) -> bool {
+    flag.strip_prefix("--").is_some_and(|name| {
+        name.starts_with(|c: char| c.is_ascii_lowercase())
+            && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+    })
 }
 
 pub(crate) fn parse_port(text: &str) -> Result<u16> {

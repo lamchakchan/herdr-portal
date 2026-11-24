@@ -200,7 +200,10 @@ const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const VERDICTS: [&str; 3] = ["approve", "block", "changes"];
 const REVIEWERS: [&str; 2] = ["self", "independent"];
 const RESULTS: [&str; 2] = ["pass", "fail"];
-const ACTIONS: [&str; 3] = ["opened", "merged", "closed"];
+/// `queued`, `requeued` and `dequeued` are the merge queue's (1179).
+const ACTIONS: [&str; 6] = [
+    "opened", "merged", "closed", "queued", "requeued", "dequeued",
+];
 const OUTCOMES: [&str; 2] = ["done", "dropped"];
 
 /// The fields a kind needs, and the optional ones it allows. Any other optional field must be absent.
@@ -474,6 +477,10 @@ mod tests {
         ("action", "opened", true),
         ("action", "merged", true),
         ("action", "closed", true),
+        ("action", "queued", true),
+        ("action", "requeued", true),
+        ("action", "dequeued", true),
+        ("action", "enqueued", false),
         ("action", "reopened", false),
         ("outcome", "done", true),
         ("outcome", "dropped", true),
@@ -706,7 +713,7 @@ mod tests {
         let mut pr = Event::new(Kind::Pr, 4_102_444_800, &work);
         pr.repo = Some(format!("{}/{}", long(39), long(100)));
         pr.number = Some(1_000_000_000);
-        pr.action = Some("opened".into());
+        pr.action = Some("requeued".into());
         for e in [start, review, pr] {
             assert_eq!(validate(&e), Ok(()), "{e:?}");
             let len = encode_line(&e).len();

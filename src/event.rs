@@ -135,32 +135,27 @@ fn invalid(field: &'static str) -> anyhow::Error {
     )
 }
 
-/// `<state>/history`, made 0700 (and set to 0700 if it was looser). A symlink or anything but a directory there is
-/// refused before any chmod, so the chmod never reaches another directory (1176).
+/// `<state>/history`, made 0700 (and set to 0700 if it was looser). It is opened with O_DIRECTORY|O_NOFOLLOW and
+/// chmodded through that fd, so a symlink or anything but a directory there is refused and the chmod never reaches
+/// another directory (1176, 1178).
 pub(crate) fn history_dir() -> Result<PathBuf> {
     let dir = state_dir()?.join("history");
-    let refused = || {
-        err(
-            "internal",
-            "The history directory is not a plain directory.",
-        )
-    };
-    match fs::symlink_metadata(&dir) {
-        Ok(meta) if !meta.file_type().is_dir() => return Err(refused()),
-        Ok(_) => {}
-        Err(_) => {
-            if let Err(e) = fs::DirBuilder::new().mode(0o700).create(&dir) {
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(err("internal", "Could not make the history directory."));
-                }
-            }
-            // Made by us or by a writer running at once: still only a plain directory.
-            if !fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir()) {
-                return Err(refused());
-            }
+    if let Err(e) = fs::DirBuilder::new().mode(0o700).create(&dir) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(err("internal", "Could not make the history directory."));
         }
     }
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+    let fd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&dir)
+        .map_err(|_| {
+            err(
+                "internal",
+                "The history directory is not a plain directory.",
+            )
+        })?;
+    fd.set_permissions(fs::Permissions::from_mode(0o700))
         .map_err(|_| err("internal", "Could not make the history directory private."))?;
     Ok(dir)
 }
@@ -169,7 +164,8 @@ pub(crate) fn history_dir() -> Result<PathBuf> {
 /// leaves the file as it is (1174): truncating back could cut another writer's line, and the reader drops a partial one.
 ///
 /// The file is opened without following a symlink and without blocking (a FIFO fails at once), then must be a regular
-/// file this user owns, and is made 0600 through the open fd (1176).
+/// file this user owns with no other link to it (a hard link could reach a file elsewhere), and is made 0600 through
+/// the open fd (1176, 1178).
 fn append(dir: &std::path::Path, name: &str, line: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .append(true)
@@ -183,10 +179,10 @@ fn append(dir: &std::path::Path, name: &str, line: &[u8]) -> Result<()> {
         .map_err(|_| err("internal", "Could not open the history file."))?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
-    if !meta.file_type().is_file() || meta.uid() != me {
+    if !meta.file_type().is_file() || meta.uid() != me || meta.nlink() != 1 {
         return Err(err(
             "internal",
-            "The history file is not a plain file of this user's.",
+            "The history file is not a plain, unlinked file of this user's.",
         ));
     }
     file.set_permissions(fs::Permissions::from_mode(0o600))
