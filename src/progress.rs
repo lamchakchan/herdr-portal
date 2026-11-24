@@ -19,61 +19,73 @@ const PROGRESS_CAP: usize = 500;
 const TEAMS_CAP: usize = 100;
 const TRANSCRIPTS_CAP: usize = 500;
 
-const PROGRESS_KEYS: [&str; 6] = [
-    "pane_id",
-    "terminal_id",
-    "percent",
-    "activity",
-    "reported_at",
-    "session_started_at",
+const PROGRESS_KEYS: [(&str, Kind); 6] = [
+    ("pane_id", Kind::Text),
+    ("terminal_id", Kind::Text),
+    ("percent", Kind::Number),
+    ("activity", Kind::Text),
+    ("reported_at", Kind::Number),
+    ("session_started_at", Kind::Number),
 ];
-const MEMBER_KEYS: [&str; 3] = ["name", "agentType", "joinedAt"];
+const MEMBER_KEYS: [(&str, Kind); 3] = [
+    ("name", Kind::Text),
+    ("agentType", Kind::Text),
+    ("joinedAt", Kind::Number),
+];
+/// Base64 text of one frame past which the body is no longer kept: FILE_CAP + 1 bytes, encoded, and some slack.
+const BODY_CAP: usize = (FILE_CAP + 1).div_ceil(3) * 4 + 4096;
 
 pub(crate) const PROGRESS_FAILED: &str = "The progress read on the machine failed.";
 
 /// Runs on the machine as `bash -s`. It prints one framed stream: `NOW\t<epoch s>`; per file `PROGRESS\t<name>` or
 /// `TEAM\t<dir>`, its first 256 KiB + 1 byte as base64 lines, then `END` (never a base64 line, whose length is a
-/// multiple of 4); per teammate transcript `TRANSCRIPT\t<lead id>\t<name>\t<mtime s>`; and `CAP\t<what>` when a cap
-/// stopped it. A lead id reaches a path only after it matches `^[0-9a-f-]{36}$`. A missing folder prints nothing. It
-/// writes nothing on the machine.
+/// multiple of 4); `TOO_LARGE\t<kind>\t<name>`, with no body, for a file past 256 KiB; per teammate transcript
+/// `TRANSCRIPT\t<lead id>\t<name>\t<mtime s>`; and `CAP\t<what>` when a cap stopped a section. Records and team configs
+/// each have a 1 MiB budget, so a full records folder still leaves the teams. A name with any character outside
+/// `[A-Za-z0-9._:-]` (a newline would break the framing) is skipped. Lead ids come only from the teams listed, and
+/// reach a path only after they match `^[0-9a-f-]{36}$`. A missing folder prints nothing. It writes nothing on the
+/// machine.
 pub(crate) const SCRIPT: &str = r#"
 set -u
+export LC_ALL=C
 cap=262144
-total=0
+budget=1048576
 printf 'NOW\t%s\n' "$(date +%s)"
+plain() { case "$1" in ''|*[!A-Za-z0-9._:-]*) return 1 ;; esac; }
 emit() {
   size=$(wc -c < "$3" 2>/dev/null | tr -cd '0-9')
   size=${size:-0}
-  [ "$size" -gt "$cap" ] && size=$((cap + 1))
+  if [ "$size" -gt "$cap" ]; then printf 'TOO_LARGE\t%s\t%s\n' "$1" "$2"; return 0; fi
   total=$((total + size))
-  if [ "$total" -gt 2097152 ]; then printf 'CAP\ttotal\n'; exit 0; fi
+  if [ "$total" -gt "$budget" ]; then printf 'CAP\t%s\n' "$1"; return 1; fi
   printf '%s\t%s\n' "$1" "$2"
   head -c $((cap + 1)) "$3" 2>/dev/null | base64
   printf 'END\n'
 }
-n=0
+total=0; n=0
 for f in "$HOME"/.herdr-projects/.progress/*.json; do
   [ -f "$f" ] || continue
+  name=${f##*/}; plain "$name" || continue
   n=$((n + 1)); if [ "$n" -gt 500 ]; then printf 'CAP\tprogress\n'; break; fi
-  emit PROGRESS "${f##*/}" "$f"
+  emit PROGRESS "$name" "$f" || break
 done
-n=0
+total=0; n=0; ids=
 for f in "$HOME"/.claude/teams/*/config.json; do
   [ -f "$f" ] || continue
+  d=${f%/config.json}; name=${d##*/}; plain "$name" || continue
   n=$((n + 1)); if [ "$n" -gt 100 ]; then printf 'CAP\tteams\n'; break; fi
-  d=${f%/config.json}
-  emit TEAM "${d##*/}" "$f"
+  emit TEAM "$name" "$f" || break
+  ids="$ids $(head -c $((cap + 1)) "$f" 2>/dev/null | grep -o '"leadSessionId"[[:space:]]*:[[:space:]]*"[0-9a-f-]*"' | sed 's/.*"\([0-9a-f-]*\)"$/\1/')"
 done
 n=0
-for f in "$HOME"/.claude/teams/*/config.json; do
-  [ -f "$f" ] && head -c $((cap + 1)) "$f"
-done 2>/dev/null | grep -o '"leadSessionId"[[:space:]]*:[[:space:]]*"[0-9a-f-]*"' | sed 's/.*"\([0-9a-f-]*\)"$/\1/' | grep -E '^[0-9a-f-]{36}$' | sort -u |
+for id in $ids; do printf '%s\n' "$id"; done | grep -E '^[0-9a-f-]{36}$' | sort -u |
 while read -r id; do
   for f in "$HOME"/.claude/projects/*/"$id"/subagents/agent-a*.jsonl; do
     [ -f "$f" ] || continue
+    name=${f##*/}; plain "$name" || continue
     n=$((n + 1)); if [ "$n" -gt 500 ]; then printf 'CAP\ttranscripts\n'; break 2; fi
     t=$(stat -c %.3Y "$f" 2>/dev/null || stat -f %Fm "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null) || continue
-    printf 'TRANSCRIPT\t%s\t%s\t%s\n' "$id" "${f##*/}" "$t"
+    printf 'TRANSCRIPT\t%s\t%s\t%s\n' "$id" "$name" "$t"
   done
 done
 "#;
@@ -94,18 +106,26 @@ fn is_lead_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')
 }
 
-/// Standard base64, padding optional, white space ignored. None when it isn't base64.
+/// Standard base64, padding optional and only at the end, white space ignored. None when it isn't base64.
 fn decode_base64(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
     let (mut acc, mut bits) = (0u32, 0u32);
+    let mut padded = false;
     for b in text.bytes() {
+        if padded && !matches!(b, b'=' | b'\n' | b'\r' | b' ' | b'\t') {
+            return None;
+        }
         let v = match b {
+            b'=' => {
+                padded = true;
+                continue;
+            }
             b'A'..=b'Z' => b - b'A',
             b'a'..=b'z' => b - b'a' + 26,
             b'0'..=b'9' => b - b'0' + 52,
             b'+' => 62,
             b'/' => 63,
-            b'=' | b'\n' | b'\r' | b' ' | b'\t' => continue,
+            b'\n' | b'\r' | b' ' | b'\t' => continue,
             _ => return None,
         };
         acc = (acc << 6) | u32::from(v);
@@ -119,12 +139,33 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The keys asked for, from an object; everything else dropped.
-fn only(value: &Value, keys: &[&str]) -> Option<Value> {
+/// The type a kept key's value must have. Anything else (an object or array above all, which could carry a dropped
+/// key such as `prompt`) is dropped with the key.
+#[derive(Clone, Copy)]
+enum Kind {
+    Text,
+    Number,
+}
+
+impl Kind {
+    fn holds(self, value: &Value) -> bool {
+        match self {
+            Kind::Text => value.is_string(),
+            Kind::Number => value.is_number(),
+        }
+    }
+}
+
+/// The keys asked for, from an object, when their value has the kind asked for; everything else dropped.
+fn only(value: &Value, keys: &[(&str, Kind)]) -> Option<Value> {
     let map = value.as_object()?;
     Some(Value::Object(
         keys.iter()
-            .filter_map(|k| map.get(*k).map(|v| ((*k).to_string(), v.clone())))
+            .filter_map(|(k, kind)| {
+                map.get(*k)
+                    .filter(|v| kind.holds(v))
+                    .map(|v| ((*k).to_string(), v.clone()))
+            })
             .collect(),
     ))
 }
@@ -151,7 +192,7 @@ fn team_config(bytes: &[u8]) -> Result<Value, &'static str> {
     let doc: Value = serde_json::from_slice(bytes).map_err(|_| "bad_json")?;
     let map = doc.as_object().ok_or("bad_json")?;
     let mut config = serde_json::Map::new();
-    if let Some(lead) = map.get("leadSessionId") {
+    if let Some(lead) = map.get("leadSessionId").filter(|v| v.is_string()) {
         config.insert("leadSessionId".into(), lead.clone());
     }
     if let Some(members) = map.get("members").and_then(Value::as_array) {
@@ -186,22 +227,48 @@ pub(crate) fn parse_stream(text: &str) -> Result<Collected> {
     while let Some(line) = lines.next() {
         let fields: Vec<&str> = line.split('\t').collect();
         match fields.as_slice() {
-            ["NOW", secs] => now = secs.trim().parse::<i64>().ok(),
+            // The first only: a later one could only come from a name that broke the framing.
+            ["NOW", secs] if now.is_none() => now = secs.trim().parse::<i64>().ok(),
+            ["TOO_LARGE", kind @ ("PROGRESS" | "TEAM"), name] if plain_name(name) => {
+                if *kind == "PROGRESS" {
+                    if out.progress.len() >= PROGRESS_CAP {
+                        out.truncated = true;
+                        continue;
+                    }
+                    out.progress
+                        .push(json!({"file": name, "error": "too_large"}));
+                } else {
+                    if out.teams.len() >= TEAMS_CAP {
+                        out.truncated = true;
+                        continue;
+                    }
+                    out.teams.push(json!({"team": name, "error": "too_large"}));
+                }
+            }
             ["CAP", _] => out.truncated = true,
             [kind @ ("PROGRESS" | "TEAM"), name] => {
                 let mut body = String::new();
                 let mut closed = false;
+                let mut over = false;
                 for next in lines.by_ref() {
                     if next == "END" {
                         closed = true;
                         break;
                     }
-                    body.push_str(next);
+                    if body.len() + next.len() > BODY_CAP {
+                        over = true;
+                    } else {
+                        body.push_str(next);
+                    }
                 }
                 if !closed || !plain_name(name) {
                     continue;
                 }
-                let bytes = decode_base64(&body).unwrap_or_default();
+                let bytes = if over {
+                    vec![0; FILE_CAP + 1]
+                } else {
+                    decode_base64(&body).unwrap_or_default()
+                };
                 if *kind == "PROGRESS" {
                     if out.progress.len() >= PROGRESS_CAP {
                         out.truncated = true;
@@ -307,16 +374,8 @@ pub(crate) fn cmd_progress(args: &[String], json_out: bool) -> Result<()> {
             "usage: herdr-portal progress <Local|machine> [--json]",
         ));
     };
-    // A fixed message: the selector could be an SSH target.
-    let machine =
-        resolve_machine(selector).map_err(|e| match e.downcast_ref::<api::ApiError>() {
-            Some(api) if api.code == "machine_not_found" => err_with(
-                "machine_not_found",
-                "No saved machine matches the selector.",
-                api.message.clone(),
-            ),
-            _ => e,
-        })?;
+    // resolve_machine's errors name no selector in JSON (it could be an SSH target).
+    let machine = resolve_machine(selector)?;
     let out = collect(&machine, run_script)?;
     if json_out {
         return print_json(&out);
@@ -467,6 +526,68 @@ mod tests {
         assert!(parse_stream("PROGRESS\ta.json\n").is_err());
         let found = parse_stream("NOW\t5\nPROGRESS\ta.json\ne30=\n").unwrap();
         assert!(found.progress.is_empty());
+    }
+
+    #[test]
+    fn a_kept_key_holding_an_object_or_the_wrong_type_is_dropped() {
+        let record = br#"{"pane_id":{"prompt":"SENTINEL-PROMPT"},"terminal_id":"t","percent":"55","activity":["SENTINEL-PROMPT"],"reported_at":1,"session_started_at":1}"#;
+        let config = br#"{"leadSessionId":{"prompt":"SENTINEL-PROMPT"},"members":[{"name":"m","agentType":{"prompt":"SENTINEL-PROMPT"},"joinedAt":"x"}]}"#;
+        let found = parse_stream(&format!(
+            "NOW\t5\n{}{}",
+            frame("PROGRESS", "p.json", record),
+            frame("TEAM", "t", config)
+        ))
+        .unwrap();
+        assert_eq!(
+            found.progress[0]["record"],
+            json!({"terminal_id": "t", "reported_at": 1, "session_started_at": 1})
+        );
+        assert_eq!(
+            found.teams[0]["config"],
+            json!({"members": [{"name": "m"}]})
+        );
+    }
+
+    #[test]
+    fn only_the_first_clock_counts_and_a_too_large_marker_has_no_body() {
+        let found = parse_stream("NOW\t5\nNOW\t2\nTOO_LARGE\tPROGRESS\tbig.json\nTOO_LARGE\tTEAM\told\nTOO_LARGE\tTEAM\t../x\n").unwrap();
+        assert_eq!(found.now, 5);
+        assert_eq!(
+            found.progress,
+            vec![json!({"file": "big.json", "error": "too_large"})]
+        );
+        assert_eq!(
+            found.teams,
+            vec![json!({"team": "old", "error": "too_large"})]
+        );
+    }
+
+    #[test]
+    fn a_frame_body_past_the_cap_is_not_kept_in_memory() {
+        let line = "A".repeat(76);
+        let mut stream = String::from("NOW\t5\nPROGRESS\thuge.json\n");
+        for _ in 0..(BODY_CAP / 76 + 10) {
+            stream.push_str(&line);
+            stream.push('\n');
+        }
+        stream.push_str("END\n");
+        let found = parse_stream(&stream).unwrap();
+        assert_eq!(
+            found.progress,
+            vec![json!({"file": "huge.json", "error": "too_large"})]
+        );
+    }
+
+    #[test]
+    fn padding_only_at_the_end() {
+        assert!(decode_base64("YQ==YQ==").is_none());
+        assert_eq!(decode_base64("YQ==\n").unwrap(), b"a");
+    }
+
+    #[test]
+    fn the_script_skips_names_that_could_break_the_framing() {
+        assert!(SCRIPT.contains("*[!A-Za-z0-9._:-]*) return 1"));
+        assert!(SCRIPT.contains("export LC_ALL=C"));
     }
 
     #[test]

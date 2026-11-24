@@ -36,12 +36,20 @@ impl Fixture {
         )
         .unwrap();
         fs::write(progress.join("w4_p1-9f8e7d6c.json"), "{not json").unwrap();
+        // A kept key whose value is an object: it could carry a dropped key, so it goes.
+        fs::write(
+            progress.join("w2_p1-2b3c4d5e.json"),
+            r#"{"pane_id":"w2:p1","terminal_id":{"prompt":"SENTINEL-PROMPT"},"percent":5,"activity":"a","reported_at":1,"session_started_at":1}"#,
+        )
+        .unwrap();
+        // A name that would break the framing and spoof the clock.
+        fs::write(progress.join("x\nEND\nNOW\t1\nCAP\tx\nz.json"), "{}").unwrap();
         fs::write(progress.join("w5_p1-00000000.json"), vec![b' '; 300 * 1024]).unwrap();
         let team = home.join(".claude/teams/squad");
         fs::create_dir_all(&team).unwrap();
         fs::write(
             team.join("config.json"),
-            format!(r#"{{"leadSessionId":"{LEAD}","description":"SENTINEL-DESC","members":[{{"name":"impl-x","agentType":"general","joinedAt":1763990000000,"prompt":"SENTINEL-PROMPT"}}]}}"#),
+            format!(r#"{{"leadSessionId":"{LEAD}","description":"SENTINEL-DESC","members":[{{"name":"impl-x","agentType":"general","joinedAt":1763990000000,"prompt":"SENTINEL-PROMPT"}},{{"name":{{"prompt":"SENTINEL-PROMPT"}},"agentType":"g"}}]}}"#),
         )
         .unwrap();
         let subagents = home.join(format!(".claude/projects/-Users-x-repo/{LEAD}/subagents"));
@@ -51,6 +59,7 @@ impl Fixture {
             "SENTINEL-TRANSCRIPT\n",
         )
         .unwrap();
+        fs::write(subagents.join("agent-ax\nNOW\t2\n.jsonl"), "").unwrap();
         // A lead id that is not one: it must never become a path.
         fs::create_dir_all(home.join(".claude/teams/evil")).unwrap();
         fs::write(
@@ -64,8 +73,9 @@ impl Fixture {
         write_exec(
             &dir.join("bin/ssh"),
             &format!(
-                "#!/bin/sh\ncase \" $* \" in *\" -O check \"*) echo 'Master running (pid=1)' >&2; exit 0 ;; *\" -N \"*) exit 0 ;; esac\nHOME='{}' exec bash -s\n",
-                home.display()
+                "#!/bin/sh\ncase \" $* \" in *\" -O check \"*) echo 'Master running (pid=1)' >&2; exit 0 ;; *\" -N \"*) exit 0 ;; esac\nHOME='{}' exec bash -s 2>>'{}'\n",
+                home.display(),
+                dir.join("script-stderr").display()
             ),
         );
         write_exec(
@@ -151,6 +161,9 @@ fn check(machine: &str, machine_id: &str, label: &str) {
     );
     assert!(ok, "{stdout}{stderr}");
     assert_eq!(stderr, "", "nothing on stderr");
+    // The script's own stderr, which the binary drops on success; the fake ssh keeps it.
+    let script_stderr = fs::read_to_string(fixture.dir.join("script-stderr")).unwrap_or_default();
+    assert_eq!(script_stderr, "", "the script printed to stderr");
     for s in NEVER {
         assert!(!stdout.contains(s), "stdout holds {s}: {stdout}");
     }
@@ -159,7 +172,7 @@ fn check(machine: &str, machine_id: &str, label: &str) {
     assert_eq!(doc["schema"], 1);
     assert_eq!(doc["machine"], label);
     assert_eq!(doc["machine_id"], machine_id);
-    assert!(doc["now"].as_i64().unwrap() > 1_700_000_000);
+    assert!(doc["now"].as_i64().unwrap() > 1_700_000_000, "{stdout}");
     assert_eq!(doc["truncated"], false);
 
     let progress = doc["progress"].as_array().unwrap();
@@ -170,6 +183,24 @@ fn check(machine: &str, machine_id: &str, label: &str) {
             .unwrap_or_else(|| panic!("no {f}: {stdout}"))
             .clone()
     };
+    let mut files: Vec<&str> = progress
+        .iter()
+        .map(|p| p["file"].as_str().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            "w1_p2-1a2b3c4d.json",
+            "w2_p1-2b3c4d5e.json",
+            "w4_p1-9f8e7d6c.json",
+            "w5_p1-00000000.json"
+        ],
+        "{stdout}"
+    );
+    assert!(by_file("w2_p1-2b3c4d5e.json")["record"]
+        .get("terminal_id")
+        .is_none());
     let record = &by_file("w1_p2-1a2b3c4d.json")["record"];
     assert_eq!(record.as_object().unwrap().len(), 6);
     assert_eq!(record["activity"], "Fake remote activity SENTINEL-ACTIVITY");
@@ -180,7 +211,7 @@ fn check(machine: &str, machine_id: &str, label: &str) {
     let squad = teams.iter().find(|t| t["team"] == "squad").unwrap();
     assert_eq!(
         squad["config"]["members"],
-        serde_json::json!([{"name": "impl-x", "agentType": "general", "joinedAt": 1763990000000_i64}])
+        serde_json::json!([{"name": "impl-x", "agentType": "general", "joinedAt": 1763990000000_i64}, {"agentType": "g"}])
     );
     let transcripts = squad["transcripts"].as_array().unwrap();
     assert_eq!(transcripts.len(), 1);
@@ -225,6 +256,56 @@ fn an_unknown_machine_names_no_selector_in_json() {
     assert!(!ok);
     assert!(
         stdout.contains("machine_not_found") && !stdout.contains("198.51.100.7"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_full_records_folder_still_leaves_the_teams() {
+    let fixture = Fixture::new("budget");
+    let progress = fixture.dir.join("home/.herdr-projects/.progress");
+    // Nine files past 256 KiB send no body; five of 250 KB pass the 1 MiB budget for records.
+    for i in 0..9 {
+        fs::write(
+            progress.join(format!("big{i}.json")),
+            vec![b' '; 300 * 1000],
+        )
+        .unwrap();
+    }
+    for i in 0..5 {
+        fs::write(
+            progress.join(format!("fill{i}.json")),
+            vec![b' '; 250 * 1000],
+        )
+        .unwrap();
+    }
+    let (ok, stdout, stderr) = fixture.run(&["progress", "devbox", "--json"]);
+    assert!(ok, "{stdout}{stderr}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(doc["truncated"], true);
+    let teams = doc["teams"].as_array().unwrap();
+    assert!(teams.iter().any(|t| t["team"] == "squad"), "{stdout}");
+    let large = doc["progress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["error"] == "too_large")
+        .count();
+    assert!(large >= 9, "{stdout}");
+    assert!(stdout.len() < 3 * 1024 * 1024);
+}
+
+#[test]
+fn an_ambiguous_selector_names_no_target() {
+    let fixture = Fixture::new("twin");
+    write_exec(
+        &fixture.dir.join("bin/herdr"),
+        &format!("#!/bin/sh\necho '[{{\"id\":\"a1\",\"label\":\"x\",\"target\":\"{TARGET}\",\"enabled\":true}},{{\"id\":\"b2\",\"label\":\"y\",\"target\":\"{TARGET}\",\"enabled\":true}}]'\n"),
+    );
+    let (ok, stdout, _) = fixture.run(&["progress", TARGET, "--json"]);
+    assert!(!ok);
+    assert!(
+        stdout.contains("invalid_args") && !stdout.contains("192.0.2.1"),
         "{stdout}"
     );
 }
