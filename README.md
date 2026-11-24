@@ -192,6 +192,7 @@ The API for agents and scripts is the CLI with `--json`. It doesn't run a server
 | All inactive forwards | `list --json --state inactive` |
 | Remote ports not forwarded | `scan <machine> --json --state available` |
 | Agent progress and teams | `progress <machine> --json` |
+| Record a work-history event here | `event <kind> --work <id> [--field value …] [--json]` |
 | Open a forward | `add <machine> <port> [--local-port N] --json` |
 | Close a forward | `stop <local-port> --json` (add `--keep` to pause it instead) |
 | Resume a paused forward | `start <local-port> --json` |
@@ -306,6 +307,65 @@ remote agent's progress and teammates.
 - The read has 20 s and 4 MiB of output. Past either, the portal kills ssh, or the local script, with everything it
   started, and fails with `internal`.
 - An older portal answers `invalid_args` for this command.
+
+## Work history
+
+`event <kind> --work <id> …` appends one line to this machine's work history, which Headway's Agents › History view
+reads. Scripts call it at fixed points: when work starts, when an agent joins, after a review verdict, a fix round, a
+full CI run, a PR change, and when work ends. Agents never write the file by hand.
+
+```sh
+herdr-portal event start  --work AT-3400 --name impl-filter --role builder --model claude-opus-5-5 --effort high \
+                          --pane w1:p2 --terminal term-9
+herdr-portal event review --work AT-3400 --verdict changes --reviewer independent --name review-1 --model opus
+herdr-portal event fix    --work AT-3400 --round 1
+herdr-portal event ci     --work AT-3400 --result pass --head 7ee0e8ad
+herdr-portal event pr     --work AT-3400 --repo glydways/headway --number 298 --action merged
+herdr-portal event end    --work AT-3400 --outcome done
+```
+
+- **Where:** `<state>/history/<yyyy-mm>.jsonl`, one file per UTC month, append-only. The directory is 0700 and each
+  file 0600. `<state>` is herdr's plugin state directory, or `${XDG_STATE_HOME:-~/.local/state}/herdr/plugins/
+  lamchakchan.herdr-portal` when herdr doesn't set one. A machine read over SSH is read at that default only, so a
+  custom state directory is local-only.
+- **A line** is one JSON object: `schema` (1), `at` (epoch seconds, set by the portal; the caller can't set it),
+  `kind`, `work`, and the kind's fields. There is no free-text field: nothing from a prompt, a ticket or an agent's
+  words can be written.
+
+| Kind | Needs | May add |
+| --- | --- | --- |
+| `start`, `agent` | `--name`, `--role`, `--model` | `--effort`, `--pane`, `--terminal` |
+| `review` | `--verdict`, `--reviewer`, `--name`, `--model` | |
+| `fix` | `--round` | |
+| `ci` | `--result`, `--head` | |
+| `pr` | `--repo`, `--number`, `--action` | |
+| `end` | `--outcome` | |
+
+| Field | Values |
+| --- | --- |
+| `work` | A Jira key (`AT-3400`), `repo:branch` (`herdr-portal:feat/x`; `/` only between branch segments, none `.`, `..` or starting with `-`; at most 128 bytes), or a tracker id (`q-sticky-agents`, `1152`; at most 64) |
+| `name`, `terminal` | `[A-Za-z0-9][A-Za-z0-9._-]*`, at most 64 |
+| `model` | `[a-z0-9][a-z0-9.-]*`, at most 64 (`claude-opus-5-5`) |
+| `pane` | `<id>:<id>` (`w1:p2`) |
+| `role` | `builder`, `reviewer`, `designer`, `fixer`, `lead` |
+| `effort` | `low`, `medium`, `high`, `xhigh`, `max`: only what the starter stated, never a guess |
+| `verdict` | `approve`, `block`, `changes` |
+| `reviewer` | `self`, `independent` |
+| `round` | 1 to 1000 |
+| `result` | `pass`, `fail` |
+| `head` | 7 to 40 lower-case hex digits |
+| `repo` | `owner/name` |
+| `number` | 1 to 1,000,000,000 |
+| `action` | `opened`, `merged`, `closed` |
+| `outcome` | `done`, `dropped` |
+
+- A field the kind doesn't take, a missing one, an unknown flag (`--at` among them) or any value outside its pattern
+  fails with `invalid_args`. The message names the field, never the value, and nothing is written.
+- Each line, at most 1 KiB, goes in one `write(2)` on an append-only file, so writers running at once never
+  interleave. A write cut short fails with `internal` and is left as it is; the reader drops a partial line.
+- Exit 0 and no output on success. With `--json`, `{"ok": true, "event": {…}}`.
+- **Callers skip** when the binary is missing (exit 127) or answers `invalid_args` for `event`, as a portal older than
+  the command does. A missing history must never stop the work.
 
 ## Agent requests
 
