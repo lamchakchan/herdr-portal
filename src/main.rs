@@ -674,8 +674,8 @@ fn herdr_result(machine: &Machine, args: &[&str]) -> Result<Value> {
 
 fn scan_listeners(machine: &Machine) -> Result<Vec<Listener>> {
     if is_local(machine) {
-        let (code, stdout, stderr) = if Path::new("/usr/sbin/lsof").exists() || which("lsof") {
-            run_cmd(&["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"], None)?
+        let (code, stdout, stderr) = if let Some(lsof) = lsof_path() {
+            run_cmd(&[path_str(&lsof)?, "-nP", "-iTCP", "-sTCP:LISTEN"], None)?
         } else {
             run_cmd(&["ss", "-ltnpH"], None)?
         };
@@ -711,10 +711,28 @@ fi
     Ok(parse_listeners(&stdout))
 }
 
-fn which(name: &str) -> bool {
-    env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(name).exists()))
-        .unwrap_or(false)
+/// Where macOS keeps `lsof`. A caller may start the portal with a PATH that leaves /usr/sbin out (Headway does), and
+/// macOS has no `ss` to fall back to.
+const SYSTEM_LSOF: &str = "/usr/sbin/lsof";
+
+/// The `lsof` to run on this machine: the first on PATH, else `SYSTEM_LSOF`; `None` when neither exists. Both listener
+/// checks use it, so they agree on whether this machine has lsof and run the one they found.
+fn lsof_path() -> Option<PathBuf> {
+    lsof_in(env::var_os("PATH").as_deref(), Path::new(SYSTEM_LSOF))
+}
+
+fn lsof_in(path: Option<&std::ffi::OsStr>, fallback: &Path) -> Option<PathBuf> {
+    path.and_then(|paths| {
+        env::split_paths(paths)
+            .map(|dir| dir.join("lsof"))
+            .find(|p| p.exists())
+    })
+    .or_else(|| fallback.exists().then(|| fallback.to_path_buf()))
+}
+
+fn path_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| api::err_with("internal", LISTENERS_FAILED, "lsof's path is not UTF-8"))
 }
 
 fn pid_parent_map(machine: &Machine) -> Result<HashMap<u32, u32>> {
@@ -983,10 +1001,10 @@ fn forward_alive(forward: &Forward) -> Result<bool> {
             )
         })?;
     // A busy port alone is insufficient: it must belong to this SSH master.
-    let listeners = if which("lsof") {
+    let listeners = if let Some(lsof) = lsof_path() {
         let (code, stdout, stderr) = run_cmd(
             &[
-                "lsof",
+                path_str(&lsof)?,
                 "-nP",
                 "-a",
                 "-p",
@@ -1373,6 +1391,27 @@ fn parse_localhost_port(url: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsof_comes_from_path_first_then_the_system_path() {
+        let dir = std::env::temp_dir().join(format!("hp-lsof-unit-{}", std::process::id()));
+        let (on_path, system) = (dir.join("bin"), dir.join("sbin/lsof"));
+        fs::create_dir_all(&on_path).unwrap();
+        fs::create_dir_all(dir.join("sbin")).unwrap();
+        let empty = dir.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let path = env::join_paths([&empty, &on_path]).unwrap();
+        // Neither exists yet.
+        assert_eq!(lsof_in(Some(&path), &system), None);
+        fs::write(&system, "").unwrap();
+        // Only the system one: PATH leaves its folder out, as Headway's does.
+        assert_eq!(lsof_in(Some(&path), &system), Some(system.clone()));
+        assert_eq!(lsof_in(None, &system), Some(system.clone()));
+        fs::write(on_path.join("lsof"), "").unwrap();
+        // One on PATH wins over the system one.
+        assert_eq!(lsof_in(Some(&path), &system), Some(on_path.join("lsof")));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn slug_and_url() {
